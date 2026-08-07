@@ -4287,10 +4287,14 @@ def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]
     sources: List[SkillSource] = [
         OptionalSkillSource(),        # Official optional skills (highest priority)
         HermesIndexSource(auth=auth), # Centralized index (search + resolved install paths)
+        UrlSource(),                  # Direct HTTP(S) URL to a SKILL.md file
+        # Exact GitHub/tap identifiers must resolve through GitHub before
+        # skills.sh wraps the same path. This preserves private-tap provenance
+        # and ensures updates use authenticated GitHub rather than a public
+        # aggregator that other fleet hosts may not be able to read.
+        GitHubSource(auth=auth, extra_taps=extra_taps),
         SkillsShSource(auth=auth),
         WellKnownSkillSource(),
-        UrlSource(),                  # Direct HTTP(S) URL to a SKILL.md file
-        GitHubSource(auth=auth, extra_taps=extra_taps),
         ClawHubSource(),
         LobeHubSource(),
         BrowseShSource(),   # browse.sh: 169+ site-specific browser automation skills

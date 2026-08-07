@@ -469,6 +469,15 @@ class TestCreateSourceRouter:
         gh_idx = next(i for i, src in enumerate(sources) if isinstance(src, GitHubSource))
         assert url_idx < gh_idx
 
+    def test_github_runs_before_skills_sh(self):
+        # A fully-qualified tap identifier must retain GitHub provenance. If
+        # skills.sh runs first, private repos are mislabeled as public registry
+        # installs and later updates fail on hosts without aggregator access.
+        sources = create_source_router(auth=MagicMock(spec=GitHubAuth))
+        gh_idx = next(i for i, src in enumerate(sources) if isinstance(src, GitHubSource))
+        skills_sh_idx = next(i for i, src in enumerate(sources) if isinstance(src, SkillsShSource))
+        assert gh_idx < skills_sh_idx
+
 
 # ---------------------------------------------------------------------------
 # HubLockFile
