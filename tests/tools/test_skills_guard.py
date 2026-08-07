@@ -408,10 +408,32 @@ class TestFalsePositiveReductions:
         assert 1 not in env_lines
         # Bare os.environ access is still flagged.
         assert 3 in env_lines
-        # Secret-named lookups stay critical.
+        # Secret-named lookups are informational: reading a credential is the
+        # normal authentication path; a network/exfiltration sink is what
+        # turns the read into dangerous behavior.
         sec = [fi for fi in findings if fi.pattern_id == "python_environ_get_secret"]
         assert sec
-        assert all(fi.severity == "critical" for fi in sec)
+        assert all(fi.severity == "medium" for fi in sec)
+
+    def test_markdown_demotes_code_and_persistence_examples(self, tmp_path):
+        f = tmp_path / "SKILL.md"
+        f.write_text(
+            "Read ~/.hermes/config.yaml and the project AGENTS.md before setup.\n"
+            "Example only: href=/etc/passwd must be neutralized.\n"
+        )
+        findings = scan_file(f, "SKILL.md")
+        assert findings
+        assert all(fi.severity in {"low", "medium"} for fi in findings)
+
+    def test_executable_persistence_and_passwd_refs_keep_full_severity(self, tmp_path):
+        f = tmp_path / "installer.py"
+        f.write_text(
+            'target = ".hermes/config.yaml"\n'
+            'blocked = "/etc/passwd"\n'
+        )
+        findings = scan_file(f, "installer.py")
+        assert any(fi.pattern_id == "hermes_config_mod" and fi.severity == "critical" for fi in findings)
+        assert any(fi.pattern_id == "system_passwd_access" and fi.severity == "critical" for fi in findings)
 
 
 # ---------------------------------------------------------------------------

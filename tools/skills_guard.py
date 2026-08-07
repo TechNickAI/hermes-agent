@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v1"
+SCANNER_VERSION = "skills-guard-v1.1"
 
 
 
@@ -153,16 +153,15 @@ THREAT_PATTERNS = [
      "dumps all environment variables"),
     # `os.environ` bare access (dict dump / iteration) is suspicious, but the
     # common `os.environ.get("SOME_CONFIG")` form is just a config read and is
-    # the OPPOSITE of exfiltration (it reads a local var, sends nothing). The
-    # lookahead exempts `os.environ.get("<name>")` only when <name> is NOT a
-    # secret-shaped identifier — `os.environ.get("OPENAI_API_KEY")` still trips
-    # via the dedicated secret pattern just below.
-    (r'os\.environ\b(?!\s*\.get\s*\(\s*["\'](?![^"\']*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)))',
+    # the OPPOSITE of exfiltration (it reads a local var, sends nothing). A
+    # credential-shaped `.get()` read is informational; exfiltration requires a
+    # sink, not merely reading the credential that an API client needs.
+    (r'os\.environ\b(?!\s*\.get\s*\()',
      "python_os_environ", "high", "exfiltration",
      "accesses os.environ (potential env dump)"),
     (r'os\.environ\s*\.get\s*\(\s*["\'][^"\']*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)',
-     "python_environ_get_secret", "critical", "exfiltration",
-     "reads secret via os.environ.get()"),
+     "python_environ_get_secret", "medium", "exfiltration",
+     "reads secret via os.environ.get() (normal API-key access; informational)"),
     (r'os\.getenv\s*\(\s*[^\)]*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)',
      "python_getenv_secret", "critical", "exfiltration",
      "reads secret via os.getenv()"),
@@ -633,6 +632,15 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
                     description=f"invisible unicode character {char_name} (possible text hiding/injection)",
                 ))
                 break  # one finding per line for invisible chars
+
+    # Markdown skills necessarily describe commands, paths, and anti-patterns.
+    # Treat code-shaped findings there as documentation unless they are prompt
+    # injection or leaked credentials. Persistence tokens in Markdown are
+    # usually the product's own setup/runbook paths; executable files retain
+    # full severity. This extends the upstream fix from PR #37040 to the false
+    # positives reproduced against Hermes' own skill-management docs.
+    if file_path.suffix.lower() == ".md":
+        findings = _demote_doc_findings(findings)
 
     return findings
 
@@ -1150,6 +1158,33 @@ def _determine_verdict(findings: List[Finding]) -> str:
         return "caution"
     # medium/low findings alone are informational, not blocking
     return "safe"
+
+
+def _demote_doc_findings(findings: List[Finding]) -> List[Finding]:
+    """Demote code-pattern findings in Markdown documentation.
+
+    Prompt injection and credential exposure remain at full severity because
+    they are dangerous even in prose. Other categories, including references to
+    the agent's own config files, are operational documentation until executable
+    code proves otherwise.
+    """
+    keep_severity = {"injection", "credential_exposure"}
+    demote = {"critical": "medium", "high": "medium", "medium": "low"}
+    result: List[Finding] = []
+    for finding in findings:
+        if finding.category in keep_severity:
+            result.append(finding)
+            continue
+        result.append(Finding(
+            pattern_id=finding.pattern_id,
+            severity=demote.get(finding.severity, finding.severity),
+            category=finding.category,
+            file=finding.file,
+            line=finding.line,
+            match=finding.match,
+            description=finding.description,
+        ))
+    return result
 
 
 def _build_summary(name: str, source: str, trust: str, verdict: str, findings: List[Finding]) -> str:
