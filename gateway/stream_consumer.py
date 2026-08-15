@@ -220,7 +220,7 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
-        on_transient_message: Optional[Callable[[str], Any]] = None,
+        on_commentary_sent: Optional[Callable[[str], Any]] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -238,15 +238,16 @@ class GatewayStreamConsumer:
         # Gateway callers use this to pause typing refreshes before a slow
         # final rich-text edit (Telegram MarkdownV2 finalize, etc.).
         self._on_before_finalize = on_before_finalize
-        # Fired with the platform message_id of every TRANSIENT bubble this
-        # consumer creates — currently interim assistant commentary. The
-        # gateway registers these into the same cleanup set it already uses
-        # for tool-progress, heartbeat, and status bubbles, so that
-        # ``display.platforms.<plat>.cleanup_progress: true`` removes
+        # Fired with the platform message_id of a COMMENTARY bubble created by
+        # :meth:`_send_commentary` — that single call site and no other. Tool
+        # progress, heartbeat, and status bubbles are registered inline by the
+        # gateway and must NOT be routed through here, or they would be queued
+        # for deletion twice. The gateway feeds these ids into the same cleanup
+        # set so ``display.platforms.<plat>.cleanup_progress: true`` removes
         # commentary after the final answer lands instead of stranding it.
         # Called with the message id as a single str argument. Exceptions are
         # swallowed — cleanup tracking must never break delivery.
-        self._on_transient_message = on_transient_message
+        self._on_commentary_sent = on_commentary_sent
         # (visible_text, message_id) for each transient bubble sent this turn,
         # held until the turn's final text is known. See release_transient_ids.
         self._transient_candidates: list[tuple[str, str]] = []
@@ -605,21 +606,21 @@ class GatewayStreamConsumer:
         except Exception:
             logger.debug("on_new_message callback error", exc_info=True)
 
-    def _notify_transient_message(self, message_id: Optional[str]) -> None:
-        """Report a transient bubble's id for cleanup_progress tracking.
+    def _notify_commentary_sent(self, message_id: Optional[str]) -> None:
+        """Report a commentary bubble's id for cleanup_progress tracking.
 
         Mirrors :meth:`_notify_new_message`: best-effort and never raises, so a
         cleanup-bookkeeping failure cannot break message delivery. Falsy ids are
         ignored — an adapter that reports success without a usable message id
         (or one whose platform has no deletion support) simply isn't trackable.
         """
-        cb = self._on_transient_message
+        cb = self._on_commentary_sent
         if cb is None or not message_id:
             return
         try:
             cb(str(message_id))
         except Exception:
-            logger.debug("on_transient_message callback error", exc_info=True)
+            logger.debug("on_commentary_sent callback error", exc_info=True)
 
     def release_transient_ids(self, final_text: str) -> None:
         """Release held transient bubble ids for deletion, minus the final answer.
@@ -645,7 +646,7 @@ class GatewayStreamConsumer:
             if target and text == target:
                 # This bubble carries the final answer — keep it.
                 continue
-            self._notify_transient_message(message_id)
+            self._notify_commentary_sent(message_id)
 
     @staticmethod
     def _signal_flush(flush_event) -> None:

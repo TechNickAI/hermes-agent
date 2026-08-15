@@ -295,3 +295,162 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     # deletes at least one progress bubble.
     assert pre_existing_fired == [True]
     assert len(adapter.deleted) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Commentary-bubble cleanup (end-to-end through _run_agent)
+# ---------------------------------------------------------------------------
+
+
+class CommentaryAgent:
+    """Emits interim commentary, then a DIFFERENT final response.
+
+    Mirrors the common case: the model narrates ("Checking the logs now")
+    before a tool call, then answers something else entirely.
+    """
+
+    commentary = "Checking the logs now"
+    final = "done"
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = None
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.interim_assistant_callback
+        if cb is not None:
+            cb(self.commentary)
+            time.sleep(0.3)
+        return {"final_response": self.final, "messages": [], "api_calls": 1}
+
+
+class CommentaryIsFinalAgent(CommentaryAgent):
+    """Commentary text IS the final answer — the data-loss case.
+
+    When the interim path already delivered the exact final text, the gateway
+    suppresses the normal final send (#14238), so that bubble is the only copy
+    the user has. Deleting it would blank the turn.
+    """
+
+    commentary = "The deploy finished and all checks passed."
+    final = "The deploy finished and all checks passed."
+
+
+@pytest.mark.asyncio
+async def test_commentary_bubble_is_deleted_after_final(monkeypatch, tmp_path):
+    """Throwaway commentary is registered and deleted with the other chatter."""
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, CommentaryAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-c1",
+        session_key=session_key,
+    )
+    assert result["final_response"] == CommentaryAgent.final
+
+    commentary_ids = [
+        m["message_id"] for m in adapter.sent
+        if CommentaryAgent.commentary in str(m.get("content"))
+    ]
+    assert commentary_ids, "commentary bubble was never sent"
+
+    cb = adapter.pop_post_delivery_callback(session_key)
+    assert callable(cb), "cleanup callback was not registered"
+    await _fire_post_delivery_cb(cb)
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if adapter.deleted:
+            break
+
+    deleted_ids = {str(d["message_id"]) for d in adapter.deleted}
+    for mid in commentary_ids:
+        assert str(mid) in deleted_ids, (
+            f"commentary bubble {mid} should have been deleted; "
+            f"deleted={deleted_ids}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_commentary_carrying_final_answer_survives(monkeypatch, tmp_path):
+    """DATA LOSS GUARD, end to end: the answer-bearing bubble is never deleted."""
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, CommentaryIsFinalAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+
+    await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-c2",
+        session_key=session_key,
+    )
+
+    answer_ids = [
+        m["message_id"] for m in adapter.sent
+        if CommentaryIsFinalAgent.final in str(m.get("content"))
+    ]
+    assert answer_ids, "answer bubble was never sent"
+
+    cb = adapter.pop_post_delivery_callback(session_key)
+    if callable(cb):
+        await _fire_post_delivery_cb(cb)
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            if adapter.deleted:
+                break
+
+    deleted_ids = {str(d["message_id"]) for d in adapter.deleted}
+    for mid in answer_ids:
+        assert str(mid) not in deleted_ids, (
+            f"bubble {mid} carries the final answer and must NOT be deleted; "
+            f"deleted={deleted_ids}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_commentary_not_registered_when_cleanup_off(monkeypatch, tmp_path):
+    """With cleanup_progress off, no cleanup callback is registered at all."""
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, CommentaryAgent, cleanup_on=False)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+
+    await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-c3",
+        session_key=session_key,
+    )
+
+    cb = adapter.pop_post_delivery_callback(session_key)
+    if callable(cb):
+        # A bg-review release callback may legitimately be registered; firing
+        # it must still delete nothing when cleanup_progress is off.
+        await _fire_post_delivery_cb(cb)
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            if adapter.deleted:
+                break
+    assert adapter.deleted == [], (
+        f"nothing may be deleted when cleanup_progress is off; got {adapter.deleted}"
+    )
