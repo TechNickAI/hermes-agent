@@ -73,9 +73,25 @@ def _config_trusted_repos() -> set:
         raw = cfg_get(load_config(), "skills", "trusted_repos", default=[]) or []
     except Exception:
         return set()
+    # `hermes config set` stores scalars, so a list arrives as the STRING
+    # '["a/b", "c/d"]' rather than a list. Treating that as a single repo name
+    # would silently grant trust to nothing while looking correctly configured,
+    # so parse JSON first and fall back to comma/whitespace separation.
     if isinstance(raw, str):
-        raw = [raw]
-    return {str(r).strip() for r in raw if str(r).strip()}
+        text = raw.strip()
+        parsed = None
+        if text.startswith("["):
+            import json as _json
+            try:
+                parsed = _json.loads(text)
+            except ValueError:
+                parsed = None
+        if parsed is None:
+            parsed = re.split(r"[,\s]+", text.strip("[]"))
+        raw = parsed
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    return {str(r).strip().strip("\"'") for r in raw if str(r).strip().strip("\"'")}
 
 INSTALL_POLICY = {
     #                  safe      caution    dangerous
