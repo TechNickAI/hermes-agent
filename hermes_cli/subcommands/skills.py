@@ -304,8 +304,20 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     tap_subparsers.add_parser("list", help="List configured taps")
     tap_add = tap_subparsers.add_parser("add", help="Add a GitHub repo as skill source")
     tap_add.add_argument("repo", help="GitHub repo (e.g. owner/repo)")
+    tap_add.add_argument(
+        "--path",
+        default="",
+        help="Repo subdirectory holding the skills (default: skills/). "
+             "Use this to subscribe to one pack, e.g. --path skills/engineering/",
+    )
     tap_rm = tap_subparsers.add_parser("remove", help="Remove a tap")
     tap_rm.add_argument("name", help="Tap name to remove")
+    tap_rm.add_argument(
+        "--path",
+        default="",
+        help="Only remove the tap for this subdirectory; "
+             "omit to remove every tap for the repo",
+    )
 
     # config sub-action: interactive enable/disable
     skills_subparsers.add_parser(

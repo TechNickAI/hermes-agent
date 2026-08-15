@@ -1421,7 +1421,8 @@ def do_repair_official(name: str, restore: bool = False,
             pass
 
 
-def do_tap(action: str, repo: str = "", console: Optional[Console] = None) -> None:
+def do_tap(action: str, repo: str = "", console: Optional[Console] = None,
+           path: str = "") -> None:
     """Manage taps (custom GitHub repo sources)."""
     from tools.skills_hub import TapsManager
 
@@ -1444,19 +1445,22 @@ def do_tap(action: str, repo: str = "", console: Optional[Console] = None) -> No
 
     elif action == "add":
         if not repo:
-            c.print("[bold red]Error:[/] Repo required. Usage: hermes skills tap add owner/repo\n")
+            c.print("[bold red]Error:[/] Repo required. Usage: hermes skills tap add owner/repo [--path skills/core/]\n")
             return
-        if mgr.add(repo):
-            c.print(f"[bold green]Added tap:[/] {repo}\n")
+        tap_path = path or "skills/"
+        if mgr.add(repo, tap_path):
+            c.print(f"[bold green]Added tap:[/] {repo} [dim]({tap_path})[/]\n")
         else:
-            c.print(f"[yellow]Tap already exists:[/] {repo}\n")
+            c.print(f"[yellow]Tap already exists:[/] {repo} [dim]({tap_path})[/]\n")
 
     elif action == "remove":
         if not repo:
-            c.print("[bold red]Error:[/] Repo required. Usage: hermes skills tap remove owner/repo\n")
+            c.print("[bold red]Error:[/] Repo required. Usage: hermes skills tap remove owner/repo [--path skills/core/]\n")
             return
-        if mgr.remove(repo):
-            c.print(f"[bold green]Removed tap:[/] {repo}\n")
+        # No --path removes every tap for the repo; with --path only that one.
+        if mgr.remove(repo, path or None):
+            suffix = f" [dim]({path})[/]" if path else ""
+            c.print(f"[bold green]Removed tap:[/] {repo}{suffix}\n")
         else:
             c.print(f"[bold red]Error:[/] Tap not found: {repo}\n")
 
@@ -1786,7 +1790,7 @@ def skills_command(args) -> None:
         if not tap_action:
             _console.print("Usage: hermes skills tap [list|add|remove]\n")
             return
-        do_tap(tap_action, repo=repo)
+        do_tap(tap_action, repo=repo, path=getattr(args, "path", "") or "")
     else:
         _console.print("Usage: hermes skills [browse|search|install|inspect|list|list-modified|diff|check|update|audit|uninstall|reset|opt-out|opt-in|publish|snapshot|tap]\n")
         _console.print("Run 'hermes skills <command> --help' for details.\n")

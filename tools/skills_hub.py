@@ -3749,6 +3749,20 @@ class HubLockFile:
 # Taps management
 # ---------------------------------------------------------------------------
 
+def _normalize_tap_path(path: str) -> str:
+    """Canonical form of a tap's repo-relative path.
+
+    Taps are identified by (repo, path), so ``skills``, ``skills/`` and
+    ``/skills/`` must compare equal or the same subscription could be added
+    twice. Returns a bare-slash-suffixed form; an empty path means the repo
+    root and normalizes to ``""``.
+    """
+    if not isinstance(path, str):
+        return "skills/"
+    stripped = path.strip().strip("/")
+    return f"{stripped}/" if stripped else ""
+
+
 class TapsManager:
     """Manages the taps.json file — custom GitHub repo sources."""
 
@@ -3768,22 +3782,47 @@ class TapsManager:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps({"taps": taps}, indent=2) + "\n", encoding="utf-8")
 
-    def add(self, repo: str, path: str = "skills/") -> bool:
-        """Add a tap. Returns False if already exists."""
-        taps = self.load()
-        if any(t["repo"] == repo for t in taps):
+    @staticmethod
+    def _matches(tap: dict, repo: str, path: Optional[str]) -> bool:
+        """Does *tap* identify the same subscription as (repo, path)?
+
+        A *path* of None matches every tap for the repo, which is what the
+        single-argument ``remove(repo)`` callers expect.
+        """
+        if tap.get("repo") != repo:
             return False
-        taps.append({"repo": repo, "path": path})
+        if path is None:
+            return True
+        return _normalize_tap_path(tap.get("path", "skills/")) == _normalize_tap_path(path)
+
+    def add(self, repo: str, path: str = "skills/") -> bool:
+        """Add a tap. Returns False if this repo+path pair already exists.
+
+        Identity is the (repo, path) pair, not the repo alone. One repository
+        can hold several independent skill collections in different
+        subdirectories (``skills/core/``, ``skills/engineering/``), and an
+        agent commonly subscribes to more than one of them. Keying on repo
+        alone would silently drop every tap after the first.
+        """
+        taps = self.load()
+        if any(self._matches(t, repo, path) for t in taps):
+            return False
+        taps.append({"repo": repo, "path": _normalize_tap_path(path)})
         self.save(taps)
         return True
 
-    def remove(self, repo: str) -> bool:
-        """Remove a tap by repo name. Returns False if not found."""
+    def remove(self, repo: str, path: Optional[str] = None) -> bool:
+        """Remove a tap. Returns False if no matching tap was found.
+
+        With *path* omitted every tap for *repo* is removed, which keeps the
+        single-tap-per-repo callers working unchanged. Pass *path* to drop one
+        specific subdirectory subscription and leave the repo's others alone.
+        """
         taps = self.load()
-        new_taps = [t for t in taps if t["repo"] != repo]
-        if len(new_taps) == len(taps):
+        kept = [t for t in taps if not self._matches(t, repo, path)]
+        if len(kept) == len(taps):
             return False
-        self.save(new_taps)
+        self.save(kept)
         return True
 
     def list_taps(self) -> List[dict]:
