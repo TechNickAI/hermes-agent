@@ -5478,7 +5478,7 @@ class TurnRunner:
                         # Track interim commentary bubbles so cleanup_progress
                         # deletes them with the other transient chatter. Gated
                         # on the flag so behaviour is unchanged when it is off.
-                        on_transient_message=(
+                        on_commentary_sent=(
                             (lambda mid: ctx._cleanup_msg_ids.append(mid))
                             if ctx._cleanup_progress
                             else None
@@ -5515,7 +5515,7 @@ class TurnRunner:
                 return
             if already_streamed or not ctx._status_adapter or not str(display_text or "").strip():
                 return
-            safe_schedule_threadsafe(
+            _fut = safe_schedule_threadsafe(
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     display_text,
@@ -5525,6 +5525,23 @@ class TurnRunner:
                 logger=logger,
                 log_message="interim_assistant_callback scheduling error",
             )
+            # Sibling of the consumer-path commentary fix: when the stream
+            # consumer could not be constructed, commentary is sent directly
+            # here and would otherwise never be registered for cleanup, so
+            # cleanup_progress would still strand it on this path. Held as a
+            # (text, id) candidate exactly like the consumer path so the
+            # final-answer guard in _release_untracked_commentary applies —
+            # this bubble can also BE the answer.
+            if ctx._cleanup_progress and _fut is not None:
+                def _hold_interim_id(fut, _text=display_text) -> None:
+                    try:
+                        res = fut.result()
+                    except Exception:
+                        return
+                    mid = getattr(res, "message_id", None)
+                    if getattr(res, "success", False) and mid:
+                        ctx._interim_fallback_candidates.append((_text.strip(), str(mid)))
+                _fut.add_done_callback(_hold_interim_id)
 
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
 
@@ -28299,6 +28316,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             on_missing_cursor="fallback",
                         )
                     )
+                    # No on_commentary_sent here: the proxy path cannot emit
+                    # interim commentary (interim_assistant_callback is wired
+                    # only on the main path) and has no cleanup machinery at
+                    # all, so there is nothing to register. If a future change
+                    # gives this path commentary, wire the callback too.
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
                         chat_id=source.chat_id,
@@ -30419,14 +30441,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # that actually carried the final answer is withheld there, because
         # run.py may have suppressed the normal final send on the strength of
         # it (#14238) — deleting it would leave the user with an empty turn.
-        if _cleanup_progress and _sc is not None:
+        if _cleanup_progress:
+            _final_for_release = (
+                (response.get("final_response") or "")
+                if isinstance(response, dict) else ""
+            )
+            if _sc is not None:
+                try:
+                    _sc.release_transient_ids(_final_for_release)
+                except Exception as _rel_err:
+                    logger.debug("Transient id release failed: %s", _rel_err)
+            # Same guard for commentary delivered on the no-consumer fallback
+            # path, whose ids were held on the turn context instead.
             try:
-                _sc.release_transient_ids(
-                    (response.get("final_response") or "")
-                    if isinstance(response, dict) else ""
-                )
-            except Exception as _rel_err:
-                logger.debug("Transient id release failed: %s", _rel_err)
+                _held = list(turn_ctx._interim_fallback_candidates)
+                turn_ctx._interim_fallback_candidates.clear()
+                _tgt = str(_final_for_release or "").strip()
+                for _text, _mid in _held:
+                    if _mid and not (_tgt and _text == _tgt):
+                        _cleanup_msg_ids.append(_mid)
+            except Exception as _rel_err2:
+                logger.debug("Interim fallback id release failed: %s", _rel_err2)
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as
