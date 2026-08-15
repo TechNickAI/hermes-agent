@@ -5472,6 +5472,14 @@ class TurnRunner:
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
+                        # Track interim commentary bubbles so cleanup_progress
+                        # deletes them with the other transient chatter. Gated
+                        # on the flag so behaviour is unchanged when it is off.
+                        on_transient_message=(
+                            (lambda mid: ctx._cleanup_msg_ids.append(mid))
+                            if ctx._cleanup_progress
+                            else None
+                        ),
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
@@ -29823,6 +29831,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Failed to edit streamed message for session %s: %s",
                             session_key or "?", _edit_err,
                         )
+
+        # Release held transient (commentary) bubble ids into the cleanup set,
+        # now that the turn's real final text is known. Any commentary bubble
+        # that actually carried the final answer is withheld there, because
+        # run.py may have suppressed the normal final send on the strength of
+        # it (#14238) — deleting it would leave the user with an empty turn.
+        if _cleanup_progress and _sc is not None:
+            try:
+                _sc.release_transient_ids(
+                    (response.get("final_response") or "")
+                    if isinstance(response, dict) else ""
+                )
+            except Exception as _rel_err:
+                logger.debug("Transient id release failed: %s", _rel_err)
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as
