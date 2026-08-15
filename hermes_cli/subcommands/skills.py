@@ -306,7 +306,7 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     tap_add.add_argument("repo", help="GitHub repo (e.g. owner/repo)")
     tap_add.add_argument(
         "--path",
-        default="",
+        default=None,
         help="Repo subdirectory holding the skills (default: skills/). "
              "Use this to subscribe to one pack, e.g. --path skills/engineering/",
     )
@@ -314,7 +314,7 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     tap_rm.add_argument("name", help="Tap name to remove")
     tap_rm.add_argument(
         "--path",
-        default="",
+        default=None,
         help="Only remove the tap for this subdirectory; "
              "omit to remove every tap for the repo",
     )

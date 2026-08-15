@@ -761,7 +761,22 @@ class GitHubSource(SkillSource):
     # -- Internal helpers --
 
     def _list_skills_in_repo(self, repo: str, path: str) -> List[SkillMeta]:
-        """List skill directories in a GitHub repo path, using cached index."""
+        """List skill directories in a GitHub repo path, using cached index.
+
+        The path is validated here, not only where taps are added. taps.json is
+        an ordinary file on disk that a user, a sync process, or an attacker
+        with write access can edit directly, and ``..`` segments in the path
+        are resolved by the HTTP client BEFORE the request is sent — silently
+        retargeting the fetch at a different repository. Skills fetched this
+        way become agent instructions, so this is the enforcement point that
+        actually matters.
+        """
+        try:
+            path = _normalize_tap_path(path)
+        except (ValueError, TypeError) as e:
+            logger.warning("Refusing unsafe tap path for %s: %s", repo, e)
+            return []
+
         cache_key = f"{repo}_{path}".replace("/", "_").replace(" ", "_")
         cached = self._read_cache(cache_key)
         if cached is not None:
@@ -3752,14 +3767,43 @@ class HubLockFile:
 def _normalize_tap_path(path: str) -> str:
     """Canonical form of a tap's repo-relative path.
 
-    Taps are identified by (repo, path), so ``skills``, ``skills/`` and
-    ``/skills/`` must compare equal or the same subscription could be added
-    twice. Returns a bare-slash-suffixed form; an empty path means the repo
-    root and normalizes to ``""``.
+    Taps are identified by (repo, path), so ``skills``, ``skills/``,
+    ``/skills/`` and ``skills//core`` must all compare equal or the same
+    subscription could be added twice. Returns a slash-suffixed form; an empty
+    path means the repo root and normalizes to ``""``.
+
+    Raises ValueError on a path that could escape the repository it names.
+    The value is interpolated into
+    ``https://api.github.com/repos/{repo}/contents/{path}``, and httpx resolves
+    ``..`` segments before sending, so ``../../../owner/other`` silently
+    retargets the request at a DIFFERENT repository (verified against the live
+    API). Skills fetched from a tap become agent instructions, so a redirected
+    source is a prompt-injection vector, not merely a wrong-content bug.
     """
     if not isinstance(path, str):
-        return "skills/"
-    stripped = path.strip().strip("/")
+        raise TypeError(f"tap path must be a string, got {type(path).__name__}")
+    candidate = path.strip()
+    # Check for a scheme BEFORE collapsing duplicate separators: collapsing
+    # rewrites "https://host" to "https:/host", after which a "://" test can
+    # never fire.
+    if "://" in candidate:
+        raise ValueError(f"tap path must be repo-relative, not a URL: {path!r}")
+    # Collapse duplicate separators: skills//core and skills/core address the
+    # same GitHub directory, so they must not register as two taps.
+    collapsed = re.sub(r"/+", "/", candidate)
+    stripped = collapsed.strip("/")
+    segments = stripped.split("/") if stripped else []
+    if any(segment == ".." for segment in segments):
+        raise ValueError(
+            f"tap path may not traverse outside the repository: {path!r}"
+        )
+    # Drop no-op "." segments. GitHub resolves ./skills/core and skills/core to
+    # the same directory (verified against the live API: 12 entries each), so
+    # leaving them in produces two taps scanning one folder — double the API
+    # calls and every skill listed twice. The identifiers differ, so the
+    # downstream dedupe in search() cannot collapse them either.
+    segments = [segment for segment in segments if segment != "."]
+    stripped = "/".join(segments)
     return f"{stripped}/" if stripped else ""
 
 
@@ -3788,12 +3832,21 @@ class TapsManager:
 
         A *path* of None matches every tap for the repo, which is what the
         single-argument ``remove(repo)`` callers expect.
+
+        A stored tap with no ``path`` key defaults to ``""`` — the repository
+        root — because that is what the fetch path already does
+        (``tap.get("path", "")`` in ``GitHubSource.search``). Defaulting to
+        ``"skills/"`` here instead would mean a legacy ``{"repo": "x"}`` entry
+        is FETCHED from the root but MATCHED as ``skills/``, so
+        ``add(repo, "skills/")`` would refuse to add a tap that does not
+        actually exist, and ``remove(repo, "skills/")`` would delete the root
+        tap. Identity has to agree with what the fetcher does.
         """
         if tap.get("repo") != repo:
             return False
         if path is None:
             return True
-        return _normalize_tap_path(tap.get("path", "skills/")) == _normalize_tap_path(path)
+        return _normalize_tap_path(tap.get("path", "")) == _normalize_tap_path(path)
 
     def add(self, repo: str, path: str = "skills/") -> bool:
         """Add a tap. Returns False if this repo+path pair already exists.
