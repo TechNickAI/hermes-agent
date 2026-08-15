@@ -577,16 +577,133 @@ class TestTapsManager:
         assert mgr.remove("owner/skills", "skills/finance/") is False
         assert len(mgr.load()) == 1
 
-    def test_legacy_taps_without_path_still_match(self, tmp_path):
-        """A taps.json written before this change has no explicit path."""
+    def test_legacy_taps_without_path_match_the_repo_root(self, tmp_path):
+        """A pathless legacy entry means the repo ROOT, not skills/.
+
+        `GitHubSource.search` fetches such an entry with `tap.get("path", "")`,
+        so identity must use the same default. If _matches defaulted to
+        "skills/", the entry would be fetched from the root but matched as
+        skills/ — `add(repo, "skills/")` would then refuse to create a tap
+        that does not exist, and `remove(repo, "skills/")` would delete the
+        root tap the operator never named.
+        """
         taps_file = tmp_path / "taps.json"
         taps_file.write_text('{"taps": [{"repo": "owner/repo"}]}\n')
         mgr = TapsManager(path=taps_file)
-        # Default path is skills/, so re-adding the default must dedupe.
-        assert mgr.add("owner/repo", "skills/") is False
-        # A different subdirectory is genuinely new.
-        assert mgr.add("owner/repo", "skills/core/") is True
+        # The legacy entry IS the root tap.
+        assert mgr.add("owner/repo", "") is False
+        # skills/ is a genuinely different subscription and must be addable.
+        assert mgr.add("owner/repo", "skills/") is True
         assert len(mgr.load()) == 2
+        # Removing skills/ must not touch the legacy root entry.
+        assert mgr.remove("owner/repo", "skills/") is True
+        remaining = mgr.load()
+        assert len(remaining) == 1
+        assert "path" not in remaining[0] or remaining[0].get("path") == ""
+
+    def test_duplicate_slashes_are_one_tap(self, tmp_path):
+        """`skills//core` and `skills/core` address the same GitHub directory.
+
+        Left un-collapsed they register as two taps, so the same pack loads
+        twice and its skills appear twice in the agent's index.
+        """
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        assert mgr.add("owner/skills", "skills/core") is True
+        assert mgr.add("owner/skills", "skills//core") is False
+        assert mgr.add("owner/skills", "skills///core/") is False
+        assert len(mgr.load()) == 1
+
+    def test_traversal_path_is_rejected(self, tmp_path):
+        """A tap path may not escape the repository it names.
+
+        The path is interpolated into
+        https://api.github.com/repos/{repo}/contents/{path} and httpx resolves
+        `..` before sending, so this silently retargets the fetch at another
+        repository. Verified against the live API: a tap naming repo A returned
+        repo B's contents. Skills become agent instructions, so a redirected
+        source is a prompt-injection vector.
+        """
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        for evil in (
+            "../../../octocat/Hello-World/contents",
+            "skills/../../other/repo/contents",
+            "..",
+            "skills/..//../escape",
+        ):
+            with pytest.raises(ValueError, match="traverse"):
+                mgr.add("owner/skills", evil)
+        assert mgr.load() == []
+
+    def test_absolute_url_path_is_rejected(self, tmp_path):
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        with pytest.raises(ValueError, match="repo-relative"):
+            mgr.add("owner/skills", "https://evil.example.com/skills/")
+        assert mgr.load() == []
+
+    def test_non_string_path_raises(self, tmp_path):
+        """Silently coercing a bad type re-creates the original bug's shape:
+        wrong state written with no error surfaced."""
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        with pytest.raises(TypeError):
+            mgr.add("owner/skills", None)  # type: ignore[arg-type]
+
+    def test_dot_segments_normalize_away(self, tmp_path):
+        """`./skills/core` and `skills/core` are ONE tap.
+
+        GitHub resolves both to the same directory, so leaving the "." in
+        registers two taps scanning one folder: double the API calls and every
+        skill listed twice. search() dedupes by identifier, and the identifiers
+        differ, so it cannot clean this up downstream.
+        """
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        assert mgr.add("owner/skills", "skills/core") is True
+        assert mgr.add("owner/skills", "./skills/core") is False
+        assert mgr.add("owner/skills", "skills/./core") is False
+        assert mgr.add("owner/skills", "././skills/core/") is False
+        assert len(mgr.load()) == 1
+        assert mgr.load()[0]["path"] == "skills/core/"
+
+    def test_bare_dot_path_is_the_repo_root(self, tmp_path):
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        assert mgr.add("owner/skills", ".") is True
+        assert mgr.load()[0]["path"] == ""
+        assert mgr.add("owner/skills", "") is False
+
+    def test_empty_path_means_repo_root_not_wildcard(self, tmp_path):
+        """`remove(repo, "")` targets the root tap only.
+
+        Treating "" as falsy would make it mean None — remove EVERY tap for
+        the repo — so an operator asking to drop the root subscription would
+        silently lose their role packs too.
+        """
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        mgr.add("owner/skills", "")             # repo root
+        mgr.add("owner/skills", "skills/core/")
+        assert mgr.remove("owner/skills", "") is True
+        remaining = mgr.load()
+        assert len(remaining) == 1
+        assert remaining[0]["path"] == "skills/core/"
+
+    def test_fetch_refuses_traversal_from_a_hand_edited_taps_file(self):
+        """Validation cannot live only in add().
+
+        taps.json is an ordinary file: a user, a sync job, or an attacker with
+        write access can put a traversal path there without ever calling add().
+        The fetch path is the enforcement point that actually matters, so it
+        must refuse independently and make no HTTP request at all.
+        """
+        source = GitHubSource(GitHubAuth())
+        called = []
+
+        def _fail_if_called(url):
+            called.append(url)
+            raise AssertionError(f"made a request for an unsafe path: {url}")
+
+        with patch.object(source, "_github_get", _fail_if_called):
+            assert source._list_skills_in_repo(
+                "owner/repo", "../../../../repos/other/repo/contents"
+            ) == []
+        assert called == []
 
 
 # ---------------------------------------------------------------------------
