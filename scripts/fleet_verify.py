@@ -31,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-MARKER = "_notify_transient_message"
+MARKER = "_notify_commentary_sent"
 MARKER_FILE = "gateway/stream_consumer.py"
 
 
