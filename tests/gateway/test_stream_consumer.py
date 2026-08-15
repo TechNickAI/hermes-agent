@@ -1509,7 +1509,7 @@ class TestTransientCommentaryTracking:
 
         seen: list[str] = []
         consumer = GatewayStreamConsumer(
-            adapter, "chat_123", on_transient_message=seen.append
+            adapter, "chat_123", on_commentary_sent=seen.append
         )
         assert await consumer._send_commentary("Checking the logs now")
         # Held until the final text is known, then released.
@@ -1528,7 +1528,7 @@ class TestTransientCommentaryTracking:
 
         seen: list[str] = []
         consumer = GatewayStreamConsumer(
-            adapter, "chat_123", on_transient_message=seen.append
+            adapter, "chat_123", on_commentary_sent=seen.append
         )
         assert not await consumer._send_commentary("Checking the logs now")
         consumer.release_transient_ids("final answer")
@@ -1545,7 +1545,7 @@ class TestTransientCommentaryTracking:
 
         seen: list[str] = []
         consumer = GatewayStreamConsumer(
-            adapter, "chat_123", on_transient_message=seen.append
+            adapter, "chat_123", on_commentary_sent=seen.append
         )
         await consumer._send_commentary("Checking the logs now")
         consumer.release_transient_ids("final answer")
@@ -1564,7 +1564,7 @@ class TestTransientCommentaryTracking:
             raise RuntimeError("cleanup tracking exploded")
 
         consumer = GatewayStreamConsumer(
-            adapter, "chat_123", on_transient_message=boom
+            adapter, "chat_123", on_commentary_sent=boom
         )
         # Delivery still succeeds and the text is still recorded.
         assert await consumer._send_commentary("Checking the logs now")
@@ -1601,7 +1601,7 @@ class TestTransientCommentaryTracking:
 
         seen: list[str] = []
         consumer = GatewayStreamConsumer(
-            adapter, "chat_123", on_transient_message=seen.append
+            adapter, "chat_123", on_commentary_sent=seen.append
         )
         answer = "The deploy finished at 14:02 and all checks passed."
         await consumer._send_commentary(answer)
@@ -1621,7 +1621,7 @@ class TestTransientCommentaryTracking:
 
         seen: list[str] = []
         consumer = GatewayStreamConsumer(
-            adapter, "chat_123", on_transient_message=seen.append
+            adapter, "chat_123", on_commentary_sent=seen.append
         )
         answer = "All 12 gateways are healthy."
         await consumer._send_commentary("Checking the fleet now")
@@ -1643,7 +1643,7 @@ class TestTransientCommentaryTracking:
 
         seen: list[str] = []
         consumer = GatewayStreamConsumer(
-            adapter, "chat_123", on_transient_message=seen.append
+            adapter, "chat_123", on_commentary_sent=seen.append
         )
         await consumer._send_commentary("Working on it")
         consumer.release_transient_ids("different final")
@@ -1665,7 +1665,7 @@ class TestTransientCommentaryTracking:
 
         seen: list[str] = []
         consumer = GatewayStreamConsumer(
-            adapter, "chat_123", on_transient_message=seen.append
+            adapter, "chat_123", on_commentary_sent=seen.append
         )
         await consumer._send_commentary("Starting work")
         assert seen == []
