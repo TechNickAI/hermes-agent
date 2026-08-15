@@ -558,3 +558,36 @@ class TestConfigTrustedRepos:
         import tools.skills_guard as guard
         monkeypatch.setattr(guard, "_config_trusted_repos", lambda: set())
         assert guard._resolve_trust_level("acme/skills") == "community"
+
+    def test_json_string_from_config_set_is_parsed(self, monkeypatch):
+        """`hermes config set` stores scalars, so a list arrives as a STRING.
+
+        Left unparsed, '["a/b", "c/d"]' becomes one repo named
+        '["a/b", "c/d"]' — trust is granted to nothing while the config looks
+        correct. This was observed live on all 13 fleet profiles.
+        """
+        import tools.skills_guard as guard
+        from hermes_cli import config as cfgmod
+        monkeypatch.setattr(cfgmod, "load_config",
+                            lambda: {"skills": {"trusted_repos": '["a/b", "c/d"]'}})
+        assert guard._config_trusted_repos() == {"a/b", "c/d"}
+
+    def test_comma_separated_string_is_parsed(self, monkeypatch):
+        import tools.skills_guard as guard
+        from hermes_cli import config as cfgmod
+        monkeypatch.setattr(cfgmod, "load_config",
+                            lambda: {"skills": {"trusted_repos": "a/b, c/d"}})
+        assert guard._config_trusted_repos() == {"a/b", "c/d"}
+
+    def test_native_yaml_list_still_works(self, monkeypatch):
+        import tools.skills_guard as guard
+        from hermes_cli import config as cfgmod
+        monkeypatch.setattr(cfgmod, "load_config",
+                            lambda: {"skills": {"trusted_repos": ["a/b", "c/d"]}})
+        assert guard._config_trusted_repos() == {"a/b", "c/d"}
+
+    def test_unset_config_grants_no_trust(self, monkeypatch):
+        import tools.skills_guard as guard
+        from hermes_cli import config as cfgmod
+        monkeypatch.setattr(cfgmod, "load_config", lambda: {})
+        assert guard._config_trusted_repos() == set()
