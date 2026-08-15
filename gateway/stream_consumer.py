@@ -220,6 +220,7 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        on_transient_message: Optional[Callable[[str], Any]] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -237,6 +238,18 @@ class GatewayStreamConsumer:
         # Gateway callers use this to pause typing refreshes before a slow
         # final rich-text edit (Telegram MarkdownV2 finalize, etc.).
         self._on_before_finalize = on_before_finalize
+        # Fired with the platform message_id of every TRANSIENT bubble this
+        # consumer creates — currently interim assistant commentary. The
+        # gateway registers these into the same cleanup set it already uses
+        # for tool-progress, heartbeat, and status bubbles, so that
+        # ``display.platforms.<plat>.cleanup_progress: true`` removes
+        # commentary after the final answer lands instead of stranding it.
+        # Called with the message id as a single str argument. Exceptions are
+        # swallowed — cleanup tracking must never break delivery.
+        self._on_transient_message = on_transient_message
+        # (visible_text, message_id) for each transient bubble sent this turn,
+        # held until the turn's final text is known. See release_transient_ids.
+        self._transient_candidates: list[tuple[str, str]] = []
         self._initial_reply_to_id = initial_reply_to_id
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""
@@ -591,6 +604,48 @@ class GatewayStreamConsumer:
             cb()
         except Exception:
             logger.debug("on_new_message callback error", exc_info=True)
+
+    def _notify_transient_message(self, message_id: Optional[str]) -> None:
+        """Report a transient bubble's id for cleanup_progress tracking.
+
+        Mirrors :meth:`_notify_new_message`: best-effort and never raises, so a
+        cleanup-bookkeeping failure cannot break message delivery. Falsy ids are
+        ignored — an adapter that reports success without a usable message id
+        (or one whose platform has no deletion support) simply isn't trackable.
+        """
+        cb = self._on_transient_message
+        if cb is None or not message_id:
+            return
+        try:
+            cb(str(message_id))
+        except Exception:
+            logger.debug("on_transient_message callback error", exc_info=True)
+
+    def release_transient_ids(self, final_text: str) -> None:
+        """Release held transient bubble ids for deletion, minus the final answer.
+
+        Called by the gateway once the turn's real final response is known.
+
+        Commentary is normally throwaway ("I'll check the logs now…"), but the
+        interim path can also deliver the turn's actual answer — in which case
+        run.py suppresses the normal final send and that bubble becomes the ONLY
+        copy the user has. Deleting it would blank the turn. Any candidate whose
+        visible text matches the final response is therefore dropped from the
+        cleanup set rather than reported.
+
+        Safe to call more than once; the held list is cleared on first use.
+        """
+        held, self._transient_candidates = self._transient_candidates, []
+        if not held:
+            return
+        target = self._clean_for_display(final_text or "").strip()
+        for text, message_id in held:
+            if not message_id:
+                continue
+            if target and text == target:
+                # This bubble carries the final answer — keep it.
+                continue
+            self._notify_transient_message(message_id)
 
     @staticmethod
     def _signal_flush(flush_event) -> None:
@@ -2096,6 +2151,20 @@ class GatewayStreamConsumer:
                 # an interim "preview" actually carried the final response, vs.
                 # unrelated commentary delivered during a session split (#14238).
                 self._delivered_commentary_texts.append(text)
+                # Register the bubble for cleanup_progress deletion, but ONLY
+                # after recording the text above — and remember the pairing.
+                #
+                # DATA-LOSS GUARD: commentary can legitimately BE the final
+                # answer. When the interim callback already delivered the exact
+                # final text, run.py suppresses the normal final send
+                # (already_sent=True, via has_delivered_text/#14238). Deleting
+                # that bubble afterwards would erase the only copy of the
+                # answer and leave the user with an empty turn. So the id is
+                # held against its text and released for deletion only once the
+                # turn's real final text is known not to match it.
+                self._transient_candidates.append(
+                    (self._clean_for_display(text).strip(), str(getattr(result, "message_id", "") or ""))
+                )
             return result.success
         except Exception as e:
             logger.error("Commentary send error: %s", e)
