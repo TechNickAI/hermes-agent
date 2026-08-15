@@ -523,6 +523,72 @@ class TestTapsManager:
         assert mgr.remove("owner/repo") is True
         assert mgr.load() == []
 
+    def test_same_repo_different_paths_both_kept(self, tmp_path):
+        """One repo can serve several packs from different subdirectories.
+
+        Taps are identified by (repo, path). Keying on repo alone silently
+        dropped every subscription after the first, which breaks an agent
+        that needs core plus a role pack out of the same repository.
+        """
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        assert mgr.add("owner/skills", "skills/core/") is True
+        assert mgr.add("owner/skills", "skills/engineering/") is True
+        taps = mgr.load()
+        assert len(taps) == 2
+        assert {t["path"] for t in taps} == {"skills/core/", "skills/engineering/"}
+
+    def test_duplicate_repo_and_path_rejected(self, tmp_path):
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        assert mgr.add("owner/skills", "skills/core/") is True
+        assert mgr.add("owner/skills", "skills/core/") is False
+        assert len(mgr.load()) == 1
+
+    def test_path_normalized_before_comparing(self, tmp_path):
+        """`skills/core`, `skills/core/` and `/skills/core/` are one tap."""
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        assert mgr.add("owner/skills", "skills/core") is True
+        assert mgr.add("owner/skills", "skills/core/") is False
+        assert mgr.add("owner/skills", "/skills/core/") is False
+        assert len(mgr.load()) == 1
+
+    def test_remove_one_path_leaves_siblings(self, tmp_path):
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        mgr.add("owner/skills", "skills/core/")
+        mgr.add("owner/skills", "skills/engineering/")
+        assert mgr.remove("owner/skills", "skills/core/") is True
+        remaining = mgr.load()
+        assert len(remaining) == 1
+        assert remaining[0]["path"] == "skills/engineering/"
+
+    def test_remove_without_path_removes_all_for_repo(self, tmp_path):
+        """Back-compat: the old single-arg call still clears the repo."""
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        mgr.add("owner/skills", "skills/core/")
+        mgr.add("owner/skills", "skills/engineering/")
+        mgr.add("other/repo", "skills/")
+        assert mgr.remove("owner/skills") is True
+        remaining = mgr.load()
+        assert len(remaining) == 1
+        assert remaining[0]["repo"] == "other/repo"
+
+    def test_remove_nonexistent_path_returns_false(self, tmp_path):
+        mgr = TapsManager(path=tmp_path / "taps.json")
+        mgr.add("owner/skills", "skills/core/")
+        assert mgr.remove("owner/skills", "skills/finance/") is False
+        assert len(mgr.load()) == 1
+
+    def test_legacy_taps_without_path_still_match(self, tmp_path):
+        """A taps.json written before this change has no explicit path."""
+        taps_file = tmp_path / "taps.json"
+        taps_file.write_text('{"taps": [{"repo": "owner/repo"}]}\n')
+        mgr = TapsManager(path=taps_file)
+        # Default path is skills/, so re-adding the default must dedupe.
+        assert mgr.add("owner/repo", "skills/") is False
+        # A different subdirectory is genuinely new.
+        assert mgr.add("owner/repo", "skills/core/") is True
+        assert len(mgr.load()) == 2
+
+
 # ---------------------------------------------------------------------------
 # LobeHubSource._convert_to_skill_md
 # ---------------------------------------------------------------------------
