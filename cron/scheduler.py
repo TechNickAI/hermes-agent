@@ -2931,6 +2931,9 @@ def _resolve_job_interpreter(interpreter: Optional[str]) -> Optional[str]:
         raise ValueError(
             f"interpreter contains shell metacharacters: {interpreter!r}"
         )
+    # NOT resolve()d -- see _normalize_interpreter in cron/jobs.py: resolving a
+    # venv's bin/python yields the BASE interpreter and silently drops the
+    # venv's site-packages.
     p = Path(value).expanduser()
     if not p.is_absolute():
         raise ValueError(

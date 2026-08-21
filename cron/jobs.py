@@ -1428,14 +1428,25 @@ def _normalize_interpreter(interpreter: Optional[str]) -> Optional[str]:
             f"A bare name would be resolved through PATH, which the job "
             f"definition does not control."
         )
-    resolved = expanded.resolve()
-    if not resolved.exists():
-        raise ValueError(f"Cron interpreter does not exist: {resolved}")
-    if not resolved.is_file():
-        raise ValueError(f"Cron interpreter is not a file: {resolved}")
-    if not os.access(str(resolved), os.X_OK):
-        raise ValueError(f"Cron interpreter is not executable: {resolved}")
-    return str(resolved)
+    # DO NOT resolve() -- that would break virtualenvs, which are the main
+    # reason this field exists. A venv's bin/python is a SYMLINK to the base
+    # interpreter, and resolving it hands back the base python, whose
+    # sys.prefix is the base install: the venv's site-packages disappear and
+    # the job dies on the very import the field was set to satisfy. Verified
+    # live: resolving /srv/.../venv/bin/python produced a python with no
+    # psycopg, exactly the failure this field removes.
+    #
+    # Containment is not at stake here (unlike `script`, which must stay
+    # inside the scripts dir) -- an interpreter is deliberately allowed to
+    # live anywhere. So absolute + exists + file + executable is the whole
+    # contract, and symlinks are followed by the OS at exec time, as intended.
+    if not expanded.exists():
+        raise ValueError(f"Cron interpreter does not exist: {expanded}")
+    if not expanded.is_file():
+        raise ValueError(f"Cron interpreter is not a file: {expanded}")
+    if not os.access(str(expanded), os.X_OK):
+        raise ValueError(f"Cron interpreter is not executable: {expanded}")
+    return str(expanded)
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:

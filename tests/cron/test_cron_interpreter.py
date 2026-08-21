@@ -64,10 +64,38 @@ class TestNormalizeInterpreter:
         assert _normalize_interpreter("") is None
         assert _normalize_interpreter("   ") is None
 
-    def test_absolute_executable_returns_resolved_path(self, fake_interpreter):
+    def test_absolute_executable_is_accepted(self, fake_interpreter):
         from cron.jobs import _normalize_interpreter
         assert _normalize_interpreter(str(fake_interpreter)) == str(
-            fake_interpreter.resolve())
+            fake_interpreter)
+
+    def test_a_venv_symlink_is_NOT_resolved_to_its_base_python(self, tmp_path):
+        """THE BUG THIS FIELD WOULD OTHERWISE CAUSE.
+
+        A virtualenv's bin/python is a symlink to the base interpreter. Calling
+        .resolve() on it hands back the BASE python, whose sys.prefix is the
+        base install -- so the venv's site-packages vanish and the job dies on
+        the very import the interpreter was chosen to satisfy.
+
+        Caught live: resolving /srv/kenbot/shared/venv/bin/python produced an
+        interpreter with no psycopg, which is exactly what the field exists to
+        provide.
+        """
+        import stat as _stat
+        from cron.jobs import _normalize_interpreter
+        base = tmp_path / "base" / "bin" / "python3"
+        base.parent.mkdir(parents=True)
+        base.write_text("#!/bin/sh\n")
+        base.chmod(base.stat().st_mode | _stat.S_IEXEC)
+
+        venv_py = tmp_path / "venv" / "bin" / "python"
+        venv_py.parent.mkdir(parents=True)
+        venv_py.symlink_to(base)
+
+        got = _normalize_interpreter(str(venv_py))
+        assert got == str(venv_py), (
+            "the venv path must survive -- resolving it drops site-packages")
+        assert "venv" in got and "base" not in got
 
     def test_relative_path_is_rejected(self):
         """A bare name would resolve through PATH, which the job does not own."""
