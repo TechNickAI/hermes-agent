@@ -1395,6 +1395,49 @@ def save_jobs(
         _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
 
 
+def _normalize_interpreter(interpreter: Optional[str]) -> Optional[str]:
+    """Normalize and validate a cron job's explicit interpreter.
+
+    Rules mirror :func:`_normalize_workdir`:
+      - Empty / None → None (feature off, extension-based selection as before).
+      - ``~`` is expanded.  Relative paths are rejected — a bare name would be
+        resolved through ``PATH``, which the job definition does not control.
+      - Must exist, be a regular file, and be executable at create/update time.
+
+    Validated HERE so a typo is rejected when the job is written, not at 3am on
+    the first fire.  The scheduler re-validates at dispatch (an interpreter can
+    be deleted between create and run), which is deliberate belt-and-braces
+    rather than duplication.
+
+    Returns the absolute path string, or None when disabled.
+    Raises ValueError on invalid input.
+    """
+    if interpreter is None:
+        return None
+    raw = str(interpreter).strip()
+    if not raw:
+        return None
+    if any(c in raw for c in ";|&$`\n\r<>*?"):
+        raise ValueError(
+            f"Cron interpreter contains shell metacharacters: {raw!r}"
+        )
+    expanded = Path(raw).expanduser()
+    if not expanded.is_absolute():
+        raise ValueError(
+            f"Cron interpreter must be an absolute path (got {raw!r}). "
+            f"A bare name would be resolved through PATH, which the job "
+            f"definition does not control."
+        )
+    resolved = expanded.resolve()
+    if not resolved.exists():
+        raise ValueError(f"Cron interpreter does not exist: {resolved}")
+    if not resolved.is_file():
+        raise ValueError(f"Cron interpreter is not a file: {resolved}")
+    if not os.access(str(resolved), os.X_OK):
+        raise ValueError(f"Cron interpreter is not executable: {resolved}")
+    return str(resolved)
+
+
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     """Normalize and validate a cron job workdir.
 
@@ -1582,6 +1625,7 @@ def create_job(
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
+    interpreter: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
@@ -1673,6 +1717,7 @@ def create_job(
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
+    normalized_interpreter = _normalize_interpreter(interpreter)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
@@ -1778,6 +1823,11 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    # Only persist `interpreter` when explicitly set, so every existing job's
+    # serialized form is unchanged (absent key => extension-based selection,
+    # exactly as before).
+    if normalized_interpreter:
+        job["interpreter"] = normalized_interpreter
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1871,6 +1921,17 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+
+            # Validate / normalize interpreter if present.  Empty string or
+            # None both mean "clear the field", restoring extension-based
+            # selection.  Validated on the way IN so a typo is rejected by the
+            # caller rather than failing every fire from then on.
+            if "interpreter" in updates:
+                _it = updates["interpreter"]
+                if _it in {None, "", False}:
+                    updates["interpreter"] = None
+                else:
+                    updates["interpreter"] = _normalize_interpreter(_it)
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).

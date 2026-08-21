@@ -658,6 +658,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("interpreter"):
+        result["interpreter"] = job["interpreter"]
     return result
 
 
@@ -1112,6 +1114,7 @@ def cronjob(
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
+    interpreter: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
@@ -1202,6 +1205,7 @@ def cronjob(
                     context_from=context_from,
                     enabled_toolsets=enabled_toolsets or None,
                     workdir=_normalize_optional_job_value(workdir),
+                    interpreter=_normalize_optional_job_value(interpreter),
                     no_agent=_no_agent,
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
@@ -1463,6 +1467,9 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if interpreter is not None:
+                updates["interpreter"] = (
+                    _normalize_optional_job_value(interpreter) or None)
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -1612,6 +1619,10 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                 "items": {"type": "string"},
                 "description": "Optional list of toolset names to restrict the job's agent to (e.g. [\"web\", \"terminal\", \"file\", \"delegation\"]). When set, only tools from these toolsets are loaded, significantly reducing input token overhead. When omitted, all default tools are loaded. Infer from the job's prompt — e.g. use \"web\" if it calls web_search, \"terminal\" if it runs scripts, \"file\" if it reads files, \"delegation\" if it calls delegate_task. On update, pass an empty array to clear."
             },
+            "interpreter": {
+                "type": "string",
+                "description": "Optional ABSOLUTE path to the executable that runs `script`, overriding the extension-based choice (bash for .sh/.bash, Hermes's own Python otherwise). Use this when a .py job needs a dependency Hermes does not ship -- e.g. a job that talks to Postgres and needs its project's virtualenv: interpreter='/srv/app/venv/bin/python'. Without it, such a job can only be run by registering a .sh wrapper whose entire body is `exec /that/python script.py`, which is pure indirection. Must exist, be a file, and be executable; rejected at create/update time so a typo fails immediately rather than on the first fire. On update, pass an empty string to clear.",
+            },
             "workdir": {
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
@@ -1676,6 +1687,7 @@ registry.register(
         context_from=args.get("context_from"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
+        interpreter=args.get("interpreter"),
         no_agent=args.get("no_agent"),
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),

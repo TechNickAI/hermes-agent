@@ -2896,9 +2896,60 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+def _resolve_job_interpreter(interpreter: Optional[str]) -> Optional[str]:
+    """Validate a job's explicit interpreter, or ``None`` to auto-select.
+
+    The scripts directory is a trust boundary: ``_run_job_script`` refuses to
+    execute anything outside it precisely so a job definition cannot name an
+    arbitrary file to run.  An interpreter is the OTHER half of that argv, so
+    an unvalidated value re-opens the same hole from the opposite side —
+    ``interpreter: /bin/sh`` with a script of ``-c`` would be arbitrary
+    execution wearing a config field.
+
+    Constraints, all of which must hold:
+
+    * absolute path — a bare name would resolve through ``PATH``, which the
+      job definition does not control and an attacker might
+    * exists, is a regular file, and is executable by us — a typo must fail
+      loudly at dispatch, not produce a confusing ``FileNotFoundError``
+      several frames deeper
+    * no shell metacharacters — argv is passed to ``subprocess`` as a list, so
+      these cannot reach a shell, but rejecting them keeps the failure at the
+      config layer where it is readable
+
+    A rejected value raises so the run reports WHY.  Silently falling back to
+    the default interpreter would run the job under the wrong Python and look
+    like it worked — the exact silent-wrong-thing failure this field exists to
+    remove.
+    """
+    if interpreter is None:
+        return None
+    value = str(interpreter).strip()
+    if not value:
+        return None
+    if any(c in value for c in ";|&$`\n\r<>*?"):
+        raise ValueError(
+            f"interpreter contains shell metacharacters: {interpreter!r}"
+        )
+    p = Path(value).expanduser()
+    if not p.is_absolute():
+        raise ValueError(
+            f"interpreter must be an absolute path, got {interpreter!r} "
+            f"(a bare name would be resolved through PATH)"
+        )
+    if not p.exists():
+        raise ValueError(f"interpreter does not exist: {value}")
+    if not p.is_file():
+        raise ValueError(f"interpreter is not a file: {value}")
+    if not os.access(str(p), os.X_OK):
+        raise ValueError(f"interpreter is not executable: {value}")
+    return str(p)
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
+    interpreter: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2907,8 +2958,10 @@ def _run_job_script(
     prevent arbitrary script execution via path traversal or absolute
     path injection.
 
-    Supported interpreters (chosen by file extension):
+    Supported interpreters:
 
+    * an explicit ``interpreter`` argument — an absolute path to a validated
+      executable, which wins over both rules below
     * ``.sh`` / ``.bash`` — run with ``/bin/bash``
     * anything else — run with the current Python interpreter
       (``sys.executable``), preserving the original behaviour for
@@ -2931,6 +2984,13 @@ def _run_job_script(
             mutated, avoiding the global-side-effect bug where a cron
             job's ``os.chdir()`` leaks into concurrent gateway sessions
             (#69396).
+        interpreter: Optional absolute path to the executable that should run
+            the script, overriding the extension-based choice.  Exists so a
+            ``.py`` job that needs a dependency Hermes does not ship can name
+            its own virtualenv's Python instead of being wrapped in a
+            one-line ``.sh`` that does nothing but ``exec`` it.  Validated by
+            ``_resolve_job_interpreter``; an invalid value fails the run
+            rather than silently falling back.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -2972,12 +3032,32 @@ def _run_job_script(
 
     script_timeout = _get_script_timeout()
 
-    # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
-    # everything else.  We deliberately do NOT honour the file's own
-    # shebang: the scripts dir is trusted, but keeping the interpreter
-    # choice explicit here keeps the allowed surface small and auditable.
+    # Pick an interpreter.  An explicit per-job ``interpreter`` wins; otherwise
+    # bash for .sh/.bash and the current Python for everything else.  We
+    # deliberately do NOT honour the file's own shebang: the scripts dir is
+    # trusted, but keeping the interpreter choice explicit here keeps the
+    # allowed surface small and auditable.
+    #
+    # WHY AN EXPLICIT INTERPRETER EXISTS.  A ``.py`` job runs under
+    # ``sys.executable`` — Hermes's OWN venv.  A job whose code needs a
+    # dependency Hermes does not ship (a database driver, a vendor SDK) then
+    # dies on import, so the only way to run it was to register a ``.sh``
+    # wrapper whose entire body is ``exec /path/to/other/python script.py``.
+    # That wrapper is pure indirection: it exists to name an interpreter, and
+    # nothing else.  Naming the interpreter directly deletes the wrapper.
+    # A bad interpreter FAILS THE RUN with a readable reason. Every other
+    # validation failure in this function returns ``(False, msg)`` rather than
+    # raising -- a raise here would propagate into the scheduler loop for what
+    # is a per-job config error.
+    try:
+        interpreter = _resolve_job_interpreter(interpreter)
+    except ValueError as exc:
+        return False, f"Blocked: {exc}"
     suffix = path.suffix.lower()
-    if suffix in {".sh", ".bash"}:
+    if interpreter:
+        argv = [interpreter, str(path)]
+        env_overlay: dict[str, str] = {}
+    elif suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
         # shutil.which returns None — fall back to a clear error rather
@@ -3055,6 +3135,7 @@ def _run_job_script(
 
 def _run_job_script_with_claim_heartbeat(
     job: dict, script_path: str, workdir: Optional[str] = None,
+    interpreter: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -3076,7 +3157,8 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(script_path, workdir=workdir,
+                               interpreter=interpreter)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -3107,10 +3189,12 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(script_path, workdir=workdir,
+                               interpreter=interpreter)
 
     try:
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(script_path, workdir=workdir,
+                               interpreter=interpreter)
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -3181,7 +3265,8 @@ def _build_job_prompt(
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(
+                script_path, interpreter=job.get("interpreter"))
         if success:
             if script_output:
                 prompt = (
@@ -3803,6 +3888,7 @@ def run_job(
         try:
             ok, output = _run_job_script_with_claim_heartbeat(
                 job, script_path, workdir=_job_workdir,
+                interpreter=job.get("interpreter"),
             )
         except Exception as exc:
             logger.exception(
@@ -4004,7 +4090,8 @@ def run_job(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
+        prerun_script = _run_job_script_with_claim_heartbeat(
+            job, script_path, interpreter=job.get("interpreter"))
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
