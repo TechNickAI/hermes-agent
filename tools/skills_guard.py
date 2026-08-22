@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v1"
+SCANNER_VERSION = "skills-guard-v2"
 
 
 
@@ -52,6 +52,52 @@ TRUSTED_REPOS = {
     "NVIDIA/skills",
 }
 
+
+def _config_trusted_repos() -> set:
+    """Operator-declared trusted skill repos from config (`skills.trusted_repos`).
+
+    Without this, a first-party library can never be installed: an ops skill that
+    legitimately reads `os.environ.get("XAI_API_KEY")` scores `dangerous`, and
+    dangerous+community is an unconditional block that `--force` cannot override.
+    The only escape was editing this module, so every operator running their own
+    skill repo had to patch the framework.
+
+    This widens WHO you trust, not WHAT is allowed: a trusted repo still cannot
+    install a `dangerous` skill (see INSTALL_POLICY), it moves out of the
+    community tier so `caution` findings stop being fatal and `--force` becomes
+    available for non-dangerous blocks. Config, not env, per the project's
+    "secrets in .env, behavior in config.yaml" rule.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        raw = cfg_get(load_config(), "skills", "trusted_repos", default=[]) or []
+    except Exception:
+        return set()
+    # `hermes config set` stores scalars, so a list arrives as the STRING
+    # '["a/b", "c/d"]' rather than a list. Treating that as a single repo name
+    # would silently grant trust to nothing while looking correctly configured,
+    # so parse JSON first and fall back to comma/whitespace separation.
+    if isinstance(raw, str):
+        text = raw.strip()
+        # A value that LOOKS structured must BE valid structure. Falling back to
+        # token-splitting on malformed JSON turns a typo into granted trust:
+        # '[malformed acme/skills-evil]' would otherwise trust
+        # 'acme/skills-evil'. Malformed input must narrow trust, never widen it.
+        if text.startswith(("[", "{")):
+            import json as _json
+            try:
+                parsed = _json.loads(text)
+            except ValueError:
+                return set()
+            if not isinstance(parsed, list):
+                return set()
+        else:
+            parsed = re.split(r"[,\s]+", text)
+        raw = parsed
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    return {str(r).strip().strip("\"'") for r in raw if str(r).strip().strip("\"'")}
+
 INSTALL_POLICY = {
     #                  safe      caution    dangerous
     "builtin":       ("allow",  "allow",   "allow"),
@@ -65,6 +111,38 @@ INSTALL_POLICY = {
 }
 
 VERDICT_INDEX = {"safe": 0, "caution": 1, "dangerous": 2}
+
+# Inline shell spans (!`cmd`) are EXECUTED by agent/skill_preprocessing.py when
+# `skills.inline_shell` is enabled, so they are host execution rather than prose.
+# Kept byte-identical to _INLINE_SHELL_RE there; if that pattern changes, this
+# scanner must change with it or a real execution path silently loses severity.
+_INLINE_SHELL_RE = re.compile(r"!`([^`\n]+)`")
+
+# Categories whose threat lives in the PROSE itself, so they are never demoted
+# by the markdown code-block rule. A skill's text is fed to the model as
+# instructions, so "ignore previous instructions" is the actual attack payload
+# when written as prose — unlike `~/.hermes/config.yaml`, which is only a path
+# being described. Demoting these would turn the scanner off for the one class
+# of attack that specifically targets documentation.
+_PROSE_IS_THE_PAYLOAD = {"injection", "obfuscation"}
+
+# Severity demotion for markdown PROSE matches (see scan_file). A doc sentence
+# naming a sensitive path is weaker evidence than the same string in an
+# executable code block, but it is not zero evidence — so it is demoted rather
+# than dropped, and still shows up in the scan report.
+#
+# `critical` maps to `medium`, not `high`, and that is deliberate: `high` still
+# produces a `caution` verdict, and `caution` + `community` is also a block
+# (INSTALL_POLICY below). A one-step demotion would leave ordinary prose
+# uninstallable and fix nothing. The demotion has to cross the blocking
+# threshold to have any effect at all — which is precisely why it is confined to
+# markdown, to non-executable lines, and never applied to _PROSE_IS_THE_PAYLOAD.
+_DEMOTED_SEVERITY = {
+    "critical": "medium",
+    "high": "medium",
+    "medium": "low",
+    "low": "low",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -572,9 +650,79 @@ INVISIBLE_CHARS = {
 # Scanning functions
 # ---------------------------------------------------------------------------
 
+def _markdown_code_line_numbers(lines: List[str]) -> set:
+    """1-based line numbers inside fenced code blocks of a markdown document.
+
+    A skill's SKILL.md is mostly PROSE that describes commands. The sentence
+    "read ``~/.hermes/config.yaml`` before selecting a model" is documentation;
+    a shell line ``echo x >> ~/.hermes/config.yaml`` is an action. The threat
+    patterns cannot tell them apart, so scanning markdown as if every line were
+    executable makes ordinary docs score ``dangerous`` — a verdict ``--force``
+    cannot override, which is what blocked our own reviewed skills from
+    installing at all.
+
+    Fenced blocks (``` or ~~~, any info string) are treated as code and scanned
+    at full severity. Everything else is prose. Inline single-backtick spans are
+    NOT code for this purpose: that is exactly how docs quote a path or command
+    while telling you not to run it.
+
+    Code detection deliberately errs toward CODE. Three constructs that a
+    Markdown reader treats as code are therefore included, because classifying
+    any of them as prose would hand an attacker a demotion:
+
+    * CommonMark **indented code blocks** (four spaces / one tab), which are
+      valid code syntax that a naive fence-only parser misses entirely.
+    * ``!`cmd``` **inline-shell spans**, which Hermes actually EXECUTES via
+      subprocess when ``skills.inline_shell`` is enabled (see
+      ``agent/skill_preprocessing.py``). These are host execution, not prose,
+      regardless of where they appear.
+    * Fence grammar per CommonMark: a closing fence must use the SAME character,
+      be at least as long as the opener, and carry no trailing content — so a
+      nested ``` inside a ````-fence, or a bogus ```` ```not-a-close ```` line,
+      does not end the block early and expose its body as prose.
+    """
+    code_lines: set = set()
+    fence_char: str | None = None
+    fence_len = 0
+    for idx, line in enumerate(lines, start=1):
+        stripped = line.lstrip()
+        indent = len(line) - len(line.lstrip(" \t"))
+        if fence_char is None:
+            # CommonMark: an opening fence may be indented at most 3 spaces.
+            if indent <= 3 and (stripped.startswith("```") or stripped.startswith("~~~")):
+                fence_char = stripped[0]
+                fence_len = len(stripped) - len(stripped.lstrip(fence_char))
+                code_lines.add(idx)       # the fence line itself
+                continue
+            # Indented code block (4+ spaces or a tab) is code, not prose.
+            if line.strip() and (line.startswith("\t") or line.startswith("    ")):
+                code_lines.add(idx)
+                continue
+            # Inline shell is EXECUTED by the skill preprocessor.
+            if _INLINE_SHELL_RE.search(line):
+                code_lines.add(idx)
+            continue
+        # Inside a fence: everything counts as code until a VALID closing fence.
+        code_lines.add(idx)
+        if indent <= 3 and stripped.startswith(fence_char * fence_len):
+            # A closer carries only the fence run plus optional whitespace.
+            if not stripped[fence_len:].strip():
+                fence_char = None
+                fence_len = 0
+    return code_lines
+
+
 def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     """
     Scan a single file for threat patterns and invisible unicode characters.
+
+    For markdown files, findings on PROSE lines (outside fenced code blocks) are
+    demoted one severity step and marked ``prose`` in their description. Prose
+    that merely names a sensitive path is documentation, not an action; treating
+    it as equivalent to a script that writes there produced false ``dangerous``
+    verdicts on ordinary skill documentation. Findings inside fenced code blocks
+    keep their full severity, so a genuine malicious snippet still scores the
+    same as it always did.
 
     Args:
         file_path: Absolute path to the file
@@ -598,6 +746,9 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     lines = content.split('\n')
     seen = set()  # (pattern_id, line_number) for deduplication
 
+    is_markdown = file_path.suffix.lower() in {".md", ".markdown"} or file_path.name == "SKILL.md"
+    code_lines = _markdown_code_line_numbers(lines) if is_markdown else None
+
     # Regex pattern matching
     for pattern, pid, severity, category, description in _COMPILED_THREAT_PATTERNS:
         for i, line in enumerate(lines, start=1):
@@ -608,14 +759,19 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
                 matched_text = line.strip()
                 if len(matched_text) > 120:
                     matched_text = matched_text[:117] + "..."
+                eff_severity, eff_description = severity, description
+                if (code_lines is not None and i not in code_lines
+                        and category not in _PROSE_IS_THE_PAYLOAD):
+                    eff_severity = _DEMOTED_SEVERITY.get(severity, severity)
+                    eff_description = f"{description} (in prose, not a code block)"
                 findings.append(Finding(
                     pattern_id=pid,
-                    severity=severity,
+                    severity=eff_severity,
                     category=category,
                     file=rel_path,
                     line=i,
                     match=matched_text,
-                    description=description,
+                    description=eff_description,
                 ))
 
     # Invisible unicode character detection
@@ -755,13 +911,20 @@ def scan_skill_cached(
             and cached.get("scanner_version") == SCANNER_VERSION
             and cached.get("source") == source
             and cached.get("source_url") == source_url):
+        # Trust is NOT cacheable. The findings depend only on content, but the
+        # trust level depends on live config (`skills.trusted_repos`), so a
+        # deserialized `trust_level` would let a repo stay trusted after the
+        # operator revoked it — the cached bundle is unchanged, so the entry
+        # stays valid and the stale grant survives. Recompute it every hit.
+        trust_level = _resolve_trust_level(source)
         result = ScanResult(
             skill_name=skill_path.name, source=source,
-            trust_level=cached["trust_level"], verdict=cached["verdict"],
+            trust_level=trust_level, verdict=cached["verdict"],
             findings=[Finding(**item) for item in cached.get("findings", [])],
             scanned_at=cached["scanned_at"], summary=cached.get("summary", ""),
         )
         provenance = dict(cached)
+        provenance["trust_level"] = trust_level
         provenance["fresh"] = False
         result.scan_provenance = provenance
         return result, provenance
@@ -1143,7 +1306,11 @@ def _resolve_trust_level(source: str) -> str:
         return "builtin"
     # Check if source matches any trusted repo exactly, or a skill path inside
     # that repo. Do not trust sibling repositories that merely share a prefix.
-    for trusted in TRUSTED_REPOS:
+    # Operator-declared repos (config `skills.trusted_repos`) are unioned with
+    # the built-in list so running your own skill library does not require
+    # patching this module. Exact-or-subpath matching applies identically, so a
+    # declared "acme/skills" never confers trust on "acme/skills-evil".
+    for trusted in TRUSTED_REPOS | _config_trusted_repos():
         if normalized_source == trusted or normalized_source.startswith(f"{trusted}/"):
             return "trusted"
     return "community"
