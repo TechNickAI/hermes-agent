@@ -43,6 +43,38 @@ class TestBlueBubblesConfigLoading:
         assert bc.extra["require_mention"] is True
         assert bc.extra["mention_patterns"] == ["(?i)^amos\\b"]
 
+    def test_explicit_enabled_false_survives_env_credentials(self, monkeypatch):
+        """Credentials must mean "can send", not "must listen".
+
+        BlueBubbles used to assign ``enabled = True`` directly instead of going
+        through ``_enable_from_env``, making it the one platform that could not
+        be switched off from config: having a server URL and password was enough
+        to start the inbound webhook. Because no allowlist was configured, the
+        gateway then fell through to the global ``unauthorized_dm_behavior:
+        pair`` and answered unknown iMessage senders with pairing codes — real
+        contacts of the owner received "Here's your pairing code" texts.
+
+        Anyone using BlueBubbles purely as an outbound tool needs this to hold.
+        """
+        monkeypatch.setenv("BLUEBUBBLES_SERVER_URL", "http://localhost:1234")
+        monkeypatch.setenv("BLUEBUBBLES_PASSWORD", "secret")
+        from gateway.config import GatewayConfig, _apply_env_overrides
+
+        config = GatewayConfig()
+        # Mirrors what load_gateway_config() builds from an explicit
+        # ``enabled: false`` in config.yaml.
+        config.platforms[Platform.BLUEBUBBLES] = PlatformConfig(
+            enabled=False,
+            extra={"_enabled_explicit": True},
+        )
+        _apply_env_overrides(config)
+
+        bc = config.platforms[Platform.BLUEBUBBLES]
+        assert bc.enabled is False, "explicit enabled:false must not be overridden by env credentials"
+        # Credentials still load, so outbound sending keeps working.
+        assert bc.extra["server_url"] == "http://localhost:1234"
+        assert bc.extra["password"] == "secret"
+
 
 class TestBlueBubblesHelpers:
     def test_check_requirements(self, monkeypatch):
