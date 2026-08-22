@@ -2449,18 +2449,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     if bluebubbles_server_url and bluebubbles_password:
         if Platform.BLUEBUBBLES not in config.platforms:
             config.platforms[Platform.BLUEBUBBLES] = PlatformConfig()
-        # Route through _enable_from_env so an explicit ``enabled: false`` in
-        # config.yaml is honored, matching every other platform. Assigning
-        # ``enabled = True`` directly made BlueBubbles the one platform that
-        # could not be turned off from config: credentials alone force-started
-        # the inbound webhook. That is the wrong default for iMessage, where
-        # the credentials exist so the agent can SEND, not so it can answer
-        # every stranger who texts the owner's personal number. With no
-        # allowlist configured the gateway then fell through to the global
-        # ``unauthorized_dm_behavior: pair`` and replied to unknown senders
-        # with pairing codes — on 2026-08-19 it texted codes to four of the
-        # owner's real contacts. Credentials mean "can send", not "must listen".
-        _enable_from_env(Platform.BLUEBUBBLES)
+        config.platforms[Platform.BLUEBUBBLES].enabled = True
         config.platforms[Platform.BLUEBUBBLES].extra.update({
             "server_url": bluebubbles_server_url.rstrip("/"),
             "password": bluebubbles_password,
