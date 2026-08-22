@@ -9018,7 +9018,21 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot or not getattr(message, "reply_to_message", None):
             return False
         reply_user = getattr(message.reply_to_message, "from_user", None)
-        return bool(reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None))
+        if not (reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None)):
+            return False
+        # Forum topics auto-anchor every message to the topic's root service
+        # message. When the bot created that topic, the root's author is the bot,
+        # but this is not an explicit human reply and must not bypass
+        # require_mention for the entire topic.
+        reply_to_id = getattr(message.reply_to_message, "message_id", None)
+        thread_id = self._effective_message_thread_id(message)
+        if reply_to_id is not None and thread_id is not None:
+            try:
+                if int(reply_to_id) == int(thread_id):
+                    return False
+            except (TypeError, ValueError):
+                pass
+        return True
 
     @classmethod
     def _extract_bot_mention_usernames(cls, message: Message, self_username: str = "") -> set[str]:

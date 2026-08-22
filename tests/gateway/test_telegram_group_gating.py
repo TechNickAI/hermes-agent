@@ -96,13 +96,14 @@ def _group_message(
     from_user_name="Alice Example",
     thread_id=None,
     reply_to_bot=False,
+    reply_to_message_id=10,
     entities=None,
     caption=None,
     caption_entities=None,
 ):
     reply_to_message = None
     if reply_to_bot:
-        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999), message_id=10, text="previous bot reply", caption=None)
+        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999), message_id=reply_to_message_id, text="previous bot reply", caption=None)
     return SimpleNamespace(
         message_id=42,
         text=text,
@@ -299,6 +300,11 @@ def test_group_messages_can_require_direct_trigger_via_config():
     assert adapter._should_process_message(_group_message("hello everyone")) is False
     assert adapter._should_process_message(_group_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])) is True
     assert adapter._should_process_message(_group_message("replying", reply_to_bot=True)) is True
+    # Telegram forum topics auto-anchor every message to the topic root. A bot-created
+    # root is not an explicit human reply to the bot and must not bypass mention gating.
+    assert adapter._should_process_message(
+        _group_message("other bot narration", thread_id=6938, reply_to_bot=True, reply_to_message_id=6938)
+    ) is False
     # Commands must also respect require_mention when it is enabled
     assert adapter._should_process_message(_group_message("/status"), is_command=True) is False
     # Telegram's group command menu sends ``/cmd@botname`` as a single
