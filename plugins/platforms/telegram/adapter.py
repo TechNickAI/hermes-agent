@@ -47,10 +47,23 @@ def _is_transient_media_error(exc: BaseException) -> bool:
     is not enough — we walk the ``__cause__``/``__context__`` chain and also match
     known transient text. Permanent errors (BadRequest, Forbidden, InvalidToken,
     file-too-big) return False so they surface to the user immediately.
+
+    PERMANENT WINS, wherever it sits in the chain. Returning on the first
+    transient-looking node made classification depend on nesting order: a
+    ``TimedOut`` raised while handling a ``BadRequest("file is too big")`` was
+    retried three times for a file that can never download, while the same pair
+    nested the other way raised at once. So the whole reachable graph is walked
+    first — following BOTH ``__cause__`` and ``__context__``, since a node can
+    have both and the permanent one may be down the branch a single-path walk
+    ignores — and the verdict is applied afterwards in precedence order.
     """
     seen: Set[int] = set()
-    node: Optional[BaseException] = exc
-    while node is not None and id(node) not in seen:
+    stack: list[BaseException] = [exc]
+    transient = False
+    while stack:
+        node = stack.pop()
+        if node is None or id(node) in seen:
+            continue
         seen.add(id(node))
         name = node.__class__.__name__.lower()
         module = (getattr(node.__class__, "__module__", "") or "").lower()
@@ -61,23 +74,28 @@ def _is_transient_media_error(exc: BaseException) -> bool:
             "chatmigrated",
             "unauthorized",
         }:
+            # Permanent short-circuits: no retry can fix it, and no amount of
+            # transient evidence elsewhere in the chain should override it.
             return False
         if "timeout" in name or name in {"connecterror", "readerror", "networkerror",
                                          "remoteprotocolerror", "connectionerror",
                                          "poolerror", "writeerror"}:
-            return True
-        if module.startswith(("httpx", "httpcore", "anyio")) and "timeout" in name:
-            return True
-        text = str(node).lower()
-        if any(
-            marker in text
-            for marker in ("timed out", "timeout", "connection reset",
-                           "connection error", "temporarily unavailable",
-                           "server disconnected", "bad gateway")
-        ):
-            return True
-        node = node.__cause__ or node.__context__
-    return False
+            transient = True
+        elif module.startswith(("httpx", "httpcore", "anyio")) and "timeout" in name:
+            transient = True
+        else:
+            text = str(node).lower()
+            if any(
+                marker in text
+                for marker in ("timed out", "timeout", "connection reset",
+                               "connection error", "temporarily unavailable",
+                               "server disconnected", "bad gateway")
+            ):
+                transient = True
+        for nxt in (node.__cause__, node.__context__):
+            if nxt is not None and id(nxt) not in seen:
+                stack.append(nxt)
+    return transient
 
 
 def _scoped_gate_env(name: str, default: str = "") -> str:
