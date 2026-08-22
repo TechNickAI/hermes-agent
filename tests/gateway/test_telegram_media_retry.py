@@ -15,20 +15,18 @@ seen in logs/errors.log. They do not re-implement the classifier's own logic.
 """
 
 import asyncio
-import sys
+import types
 from pathlib import Path
 
 import pytest
+from unittest import mock
 
-REPO = Path(__file__).resolve().parents[2]
-for candidate in (REPO, REPO / "plugins" / "platforms" / "telegram"):
-    if str(candidate) not in sys.path:
-        sys.path.insert(0, str(candidate))
+from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
-adapter_mod = pytest.importorskip(
-    "adapter",
-    reason="Telegram adapter module not importable in this environment",
-)
+# Load via the shared helper, never `sys.path` + `import adapter`: every plugin
+# ships its own adapter.py, so a bare import races for sys.modules["adapter"]
+# between xdist workers. The conftest guard rejects the anti-pattern.
+adapter_mod = load_plugin_adapter("telegram")
 
 _is_transient = adapter_mod._is_transient_media_error
 
@@ -167,6 +165,138 @@ def test_exhausted_retries_still_surface_to_user():
         )
     assert caught.value is exc
     assert src.calls == 3
+
+
+def test_permanent_error_wins_regardless_of_chain_position():
+    """A permanent failure nested under a timeout must not be retried.
+
+    PTB wraps freely, so BadRequest("file is too big") can surface as the
+    __cause__ of a TimedOut. Classifying on the first transient-looking node
+    made the verdict depend on nesting order: this pair was retried three
+    times for a file that can never download, while the same pair nested the
+    other way raised at once.
+    """
+    from telegram.error import BadRequest, TimedOut
+
+    # The outer node must be independently transient, or this test passes
+    # without ever exercising precedence. PTB stamps "Timed out" by default;
+    # the suite's telegram mock does not, so state it explicitly.
+    outer = TimedOut("Timed out")
+    assert _is_transient(TimedOut("Timed out")) is True, "fixture must be transient alone"
+    outer.__cause__ = BadRequest("file is too big")
+    assert _is_transient(outer) is False
+
+    inner = BadRequest("file is too big")
+    inner.__cause__ = TimedOut("Timed out")
+    assert _is_transient(inner) is False
+
+
+def test_permanent_on_the_context_branch_is_still_found():
+    """A node can have BOTH __cause__ and __context__; walk both.
+
+    A single-path walk that follows `__cause__ or __context__` never sees the
+    context branch when a cause is set, so a permanent error hiding there was
+    classified transient.
+    """
+    from telegram.error import BadRequest, TimedOut
+
+    exc = TimedOut("Timed out")
+    exc.__cause__ = TimedOut("Timed out")
+    exc.__context__ = BadRequest("file is too big")
+    assert _is_transient(exc) is False
+
+
+def test_neutral_wrapper_requires_walking_to_the_inner_cause():
+    """The classifier must read the CHAIN, not just the outermost exception.
+
+    The other fixtures use telegram.error.TimedOut, which is independently
+    transient by both class name and message -- so they would pass even if
+    chain traversal were removed. This wrapper is neutral on both counts.
+    """
+    import httpcore
+
+    class _NeutralWrapper(Exception):
+        pass
+
+    exc = _NeutralWrapper("upload pipeline failed")
+    exc.__cause__ = httpcore.ReadTimeout()
+    assert _is_transient(exc) is True
+
+
+def test_backoff_is_exponential_and_not_merely_a_retry_count():
+    """Pin the schedule, not just the attempt count.
+
+    Every other retry test passes base_delay=0.0, so replacing the sleep with
+    asyncio.sleep(0) would leave the suite green while backoff silently
+    vanished.
+    """
+    slept: list = []
+
+    async def _fake_sleep(delay):
+        slept.append(delay)
+
+    src = _FlakySource(_real_readtimeout_chain(), fail_times=2)
+    with mock.patch.object(adapter_mod.asyncio, "sleep", _fake_sleep):
+        data, _ = _run(
+            adapter_mod.TelegramAdapter._download_media_with_retry(
+                src, what="photo", attempts=3
+            )
+        )
+    assert data == b"OGGDATA"
+    assert slept == [1.0, 2.0]
+
+
+def test_exhausted_photo_retry_reaches_the_user_surface():
+    """The end-to-end contract: after retries fail, the human IS told.
+
+    The helper-level test only proves the exception propagates. This drives
+    _handle_media_message itself and asserts the two user-visible effects --
+    the Telegram reply and the agent-visible note -- so that unwiring
+    _surface_media_cache_failure from the photo branch fails the suite.
+    """
+    exc = _real_readtimeout_chain()
+    photo = _FlakySource(exc, fail_times=99)
+
+    replies: list = []
+    notes: list = []
+
+    class _Msg:
+        caption = None
+        sticker = None
+        voice = audio = video = document = None
+        media_group_id = None
+
+        def __init__(self):
+            self.photo = [photo]
+
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    msg = _Msg()
+    event = types.SimpleNamespace(text="", media_urls=[], media_types=[])
+
+    adapter = object.__new__(adapter_mod.TelegramAdapter)
+    adapter._bot = None          # identity learning is a no-op without a bot
+
+    async def _surface(m, ev, kind, e, display_name=None):
+        notes.append((kind, e))
+        ev.text = (ev.text or "") + f"[{kind} failed]"
+        await m.reply_text(f"Couldn't download your {kind}.")
+
+    adapter._surface_media_cache_failure = _surface
+    adapter._media_message_type = lambda m: "photo"
+    adapter._build_message_event = lambda *a, **k: event
+    adapter._clean_bot_trigger_text = lambda t: t
+    adapter._apply_telegram_group_observe_attribution = lambda ev: ev
+    adapter.handle_message = lambda ev: asyncio.sleep(0)
+
+    update = types.SimpleNamespace(message=msg, update_id=1)
+    _run(adapter._handle_media_message(update, None))
+
+    assert photo.calls == 3, "expected the photo branch to retry via the helper"
+    assert notes and notes[0][0] == "photo", "user surface was not invoked"
+    assert replies, "the human was never told"
+    assert "[photo failed]" in event.text, "agent-visible note missing"
 
 
 def test_all_download_sites_use_the_retry_helper():
