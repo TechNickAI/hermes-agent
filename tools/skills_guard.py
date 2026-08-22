@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v1"
+SCANNER_VERSION = "skills-guard-v2"
 
 
 
@@ -79,15 +79,20 @@ def _config_trusted_repos() -> set:
     # so parse JSON first and fall back to comma/whitespace separation.
     if isinstance(raw, str):
         text = raw.strip()
-        parsed = None
-        if text.startswith("["):
+        # A value that LOOKS structured must BE valid structure. Falling back to
+        # token-splitting on malformed JSON turns a typo into granted trust:
+        # '[malformed acme/skills-evil]' would otherwise trust
+        # 'acme/skills-evil'. Malformed input must narrow trust, never widen it.
+        if text.startswith(("[", "{")):
             import json as _json
             try:
                 parsed = _json.loads(text)
             except ValueError:
-                parsed = None
-        if parsed is None:
-            parsed = re.split(r"[,\s]+", text.strip("[]"))
+                return set()
+            if not isinstance(parsed, list):
+                return set()
+        else:
+            parsed = re.split(r"[,\s]+", text)
         raw = parsed
     if not isinstance(raw, (list, tuple, set)):
         return set()
@@ -107,6 +112,12 @@ INSTALL_POLICY = {
 
 VERDICT_INDEX = {"safe": 0, "caution": 1, "dangerous": 2}
 
+# Inline shell spans (!`cmd`) are EXECUTED by agent/skill_preprocessing.py when
+# `skills.inline_shell` is enabled, so they are host execution rather than prose.
+# Kept byte-identical to _INLINE_SHELL_RE there; if that pattern changes, this
+# scanner must change with it or a real execution path silently loses severity.
+_INLINE_SHELL_RE = re.compile(r"!`([^`\n]+)`")
+
 # Categories whose threat lives in the PROSE itself, so they are never demoted
 # by the markdown code-block rule. A skill's text is fed to the model as
 # instructions, so "ignore previous instructions" is the actual attack payload
@@ -115,10 +126,17 @@ VERDICT_INDEX = {"safe": 0, "caution": 1, "dangerous": 2}
 # of attack that specifically targets documentation.
 _PROSE_IS_THE_PAYLOAD = {"injection", "obfuscation"}
 
-# One-step severity demotion for markdown PROSE matches (see scan_file). A doc
-# sentence naming a sensitive path is weaker evidence than the same string in an
+# Severity demotion for markdown PROSE matches (see scan_file). A doc sentence
+# naming a sensitive path is weaker evidence than the same string in an
 # executable code block, but it is not zero evidence — so it is demoted rather
 # than dropped, and still shows up in the scan report.
+#
+# `critical` maps to `medium`, not `high`, and that is deliberate: `high` still
+# produces a `caution` verdict, and `caution` + `community` is also a block
+# (INSTALL_POLICY below). A one-step demotion would leave ordinary prose
+# uninstallable and fix nothing. The demotion has to cross the blocking
+# threshold to have any effect at all — which is precisely why it is confined to
+# markdown, to non-executable lines, and never applied to _PROSE_IS_THE_PAYLOAD.
 _DEMOTED_SEVERITY = {
     "critical": "medium",
     "high": "medium",
@@ -648,20 +666,50 @@ def _markdown_code_line_numbers(lines: List[str]) -> set:
     at full severity. Everything else is prose. Inline single-backtick spans are
     NOT code for this purpose: that is exactly how docs quote a path or command
     while telling you not to run it.
+
+    Code detection deliberately errs toward CODE. Three constructs that a
+    Markdown reader treats as code are therefore included, because classifying
+    any of them as prose would hand an attacker a demotion:
+
+    * CommonMark **indented code blocks** (four spaces / one tab), which are
+      valid code syntax that a naive fence-only parser misses entirely.
+    * ``!`cmd``` **inline-shell spans**, which Hermes actually EXECUTES via
+      subprocess when ``skills.inline_shell`` is enabled (see
+      ``agent/skill_preprocessing.py``). These are host execution, not prose,
+      regardless of where they appear.
+    * Fence grammar per CommonMark: a closing fence must use the SAME character,
+      be at least as long as the opener, and carry no trailing content — so a
+      nested ``` inside a ````-fence, or a bogus ```` ```not-a-close ```` line,
+      does not end the block early and expose its body as prose.
     """
     code_lines: set = set()
-    fence: str | None = None
+    fence_char: str | None = None
+    fence_len = 0
     for idx, line in enumerate(lines, start=1):
         stripped = line.lstrip()
-        if fence is None:
-            if stripped.startswith("```") or stripped.startswith("~~~"):
-                fence = stripped[:3]
+        indent = len(line) - len(line.lstrip(" \t"))
+        if fence_char is None:
+            # CommonMark: an opening fence may be indented at most 3 spaces.
+            if indent <= 3 and (stripped.startswith("```") or stripped.startswith("~~~")):
+                fence_char = stripped[0]
+                fence_len = len(stripped) - len(stripped.lstrip(fence_char))
                 code_lines.add(idx)       # the fence line itself
+                continue
+            # Indented code block (4+ spaces or a tab) is code, not prose.
+            if line.strip() and (line.startswith("\t") or line.startswith("    ")):
+                code_lines.add(idx)
+                continue
+            # Inline shell is EXECUTED by the skill preprocessor.
+            if _INLINE_SHELL_RE.search(line):
+                code_lines.add(idx)
             continue
-        # Inside a fence: everything counts as code until the closing fence.
+        # Inside a fence: everything counts as code until a VALID closing fence.
         code_lines.add(idx)
-        if stripped.startswith(fence):
-            fence = None
+        if indent <= 3 and stripped.startswith(fence_char * fence_len):
+            # A closer carries only the fence run plus optional whitespace.
+            if not stripped[fence_len:].strip():
+                fence_char = None
+                fence_len = 0
     return code_lines
 
 
@@ -864,13 +912,20 @@ def scan_skill_cached(
             and cached.get("scanner_version") == SCANNER_VERSION
             and cached.get("source") == source
             and cached.get("source_url") == source_url):
+        # Trust is NOT cacheable. The findings depend only on content, but the
+        # trust level depends on live config (`skills.trusted_repos`), so a
+        # deserialized `trust_level` would let a repo stay trusted after the
+        # operator revoked it — the cached bundle is unchanged, so the entry
+        # stays valid and the stale grant survives. Recompute it every hit.
+        trust_level = _resolve_trust_level(source)
         result = ScanResult(
             skill_name=skill_path.name, source=source,
-            trust_level=cached["trust_level"], verdict=cached["verdict"],
+            trust_level=trust_level, verdict=cached["verdict"],
             findings=[Finding(**item) for item in cached.get("findings", [])],
             scanned_at=cached["scanned_at"], summary=cached.get("summary", ""),
         )
         provenance = dict(cached)
+        provenance["trust_level"] = trust_level
         provenance["fresh"] = False
         result.scan_provenance = provenance
         return result, provenance
