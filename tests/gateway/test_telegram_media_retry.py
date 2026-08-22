@@ -138,6 +138,23 @@ def test_permanent_failure_raises_on_first_attempt():
     assert src.calls == 1
 
 
+def test_default_attempts_retry_without_an_explicit_argument():
+    """Production call sites pass no ``attempts``, so the DEFAULT must retry.
+
+    Every other test here pins ``attempts=3`` explicitly, which would keep
+    passing if the default silently regressed to 1 — and the default is the
+    only value the real download sites ever use.
+    """
+    src = _FlakySource(_real_readtimeout_chain(), fail_times=2)
+    data, _ = _run(
+        adapter_mod.TelegramAdapter._download_media_with_retry(
+            src, what="voice message", base_delay=0.0
+        )
+    )
+    assert data == b"OGGDATA"
+    assert src.calls == 3
+
+
 def test_exhausted_retries_still_surface_to_user():
     """When it truly is down, the original error propagates (user IS told)."""
     exc = _real_readtimeout_chain()
