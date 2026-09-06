@@ -27,6 +27,11 @@ from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.interrupt import is_interrupted
 
+# Canonical identity-marker names. delegation_context imports only stdlib at
+# module scope (session_context is imported lazily inside the context manager),
+# so this is import-cycle safe.
+from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS
+
 logger = logging.getLogger(__name__)
 
 # Opt-in debug tracing for the interrupt/activity/poll machinery.  Set
@@ -581,9 +586,45 @@ def _cwd_marker(session_id: str) -> str:
 # with one of these prefixes (or is HERMES_UI_SESSION_ID). Used by unit tests
 # as the Python-side contract for the exclusion set; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
+#
+# The same reasoning covers the per-execution-context IDENTITY markers:
+# HERMES_DELEGATED_CHILD_CONTEXT and the dispatcher-owned HERMES_KANBAN_*
+# set. A delegate_task child shares the parent's terminal environment
+# (_resolve_container_task_id deliberately collapses child task_ids onto the
+# parent's environment), so ``export -p`` persisting either family makes it
+# STICKY for the life of the shell, in both directions:
+#
+#   * parent <- child: the child's HERMES_DELEGATED_CHILD_CONTEXT=1 outlives
+#     the child, and _is_delegated_child_cli_mutation /
+#     _assert_not_delegated_child_mutation then REFUSE every later kanban
+#     mutation from that shell — including scheduled jobs that are not
+#     delegated children at all (measured: 22 of 88 host snapshots carried
+#     the marker; a Sentinel repair queue item silently stopped dispatching).
+#   * child <- parent: the child re-inherits the parent's HERMES_KANBAN_TASK
+#     through the snapshot, defeating the otherwise-correct process-env scrub
+#     in _scrub_delegated_child_kanban_env / scrub_kanban_env and handing the
+#     child the ability to mutate the PARENT's card.
+#
+# Excluding them from the snapshot is safe for exactly the same reason as the
+# session vars: both families are injected onto every command's process env
+# (local._inject_session_context_env / hermes_subprocess_env), so a legitimate
+# holder still sees its own value on every command — it simply stops being
+# persisted for whoever runs next. Names are imported from the canonical
+# definition rather than restated, so a new key added there is covered here
+# without a second list to drift.
+_SNAPSHOT_EXCLUDED_IDENTITY_NAMES: tuple[str, ...] = (
+    DELEGATED_CHILD_ENV_MARKER,
+    *KANBAN_ENV_KEYS,
+)
+# The leading group is prefix-matched (every bridged session var starts with
+# one). The identity markers are EXACT names, so they carry a trailing
+# boundary: the shell unsets them by exact name, and a regex that also matched
+# HERMES_KANBAN_DB_PATH would promise an exclusion the dump does not perform.
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
-    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)"
+    "^declare -x ((HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
+    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)|("
+    + "|".join(re.escape(name) for name in _SNAPSHOT_EXCLUDED_IDENTITY_NAMES)
+    + ")(?![A-Za-z0-9_]))"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -621,6 +662,10 @@ def _export_dump_excluding_session_vars(
         name for name in excluded_names
         if isinstance(name, str) and name
     }
+    # Identity markers are excluded unconditionally: callers must not have to
+    # remember to pass them, and a caller that forgets would silently restore
+    # the bidirectional leak.
+    safe_names.update(_SNAPSHOT_EXCLUDED_IDENTITY_NAMES)
     extra_unset = " ".join(shlex.quote(name) for name in sorted(safe_names))
     if extra_unset:
         extra_unset = f" {extra_unset}"
