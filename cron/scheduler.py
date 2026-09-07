@@ -191,6 +191,29 @@ def _failure_streak_nudge(job: dict) -> str:
     )
 
 
+_NESTED_RUNNER_SUPPRESSION_RE = re.compile(
+    r"\s*Script exited with code \d+\s+stdout:\s*"
+    r"\(suppressed:\s*duplicate of an open condition\s*"
+    r"\(occurrence\s+\d+\)\)\s*",
+    re.IGNORECASE,
+)
+
+
+def _is_nested_runner_suppression(job: dict, error: str | None) -> bool:
+    """True only when a no-agent child explicitly suppressed its own duplicate.
+
+    A nested runner may preserve a non-zero exit for machine truth while replacing
+    its repeated card with this exact marker. Re-wrapping that marker as a fresh
+    outer cron failure defeats the child runner's dedup and floods the delivery
+    channel. Full-match the narrow envelope so a real error that merely mentions
+    the marker still reaches the operator.
+    """
+    return bool(
+        job.get("no_agent")
+        and _NESTED_RUNNER_SUPPRESSION_RE.fullmatch(str(error or ""))
+    )
+
+
 def _detect_gateway_code_skew() -> tuple[str, str] | None:
     """Boot-vs-disk revision skew for THIS process, or None.
 
@@ -7265,7 +7288,8 @@ def _run_one_job_body(
                     incident_acked, failure_incident_id = _upsert_incident_for_failure(
                         job, error or "", output_file=output_file
                     )
-                    if incident_acked and not drift_skip:
+                    nested_suppression = _is_nested_runner_suppression(job, error)
+                    if (incident_acked or nested_suppression) and not drift_skip:
                         deliver_content = ""
                     else:
                         deliver_content = (

@@ -138,6 +138,19 @@ def test_unsuppressed_occurrence_text_still_mints_distinct_incidents(monkeypatch
     assert new2 is True
 
 
+def test_nested_runner_suppression_is_narrow_and_no_agent_only():
+    marker = (
+        "Script exited with code 3\nstdout:\n"
+        "(suppressed: duplicate of an open condition (occurrence 43))"
+    )
+
+    assert sched._is_nested_runner_suppression({"no_agent": True}, marker)
+    assert not sched._is_nested_runner_suppression({"no_agent": False}, marker)
+    assert not sched._is_nested_runner_suppression(
+        {"no_agent": True}, f"real failure first\n{marker}"
+    )
+
+
 def test_error_change_mints_new_incident(monkeypatch, tmp_path):
     inc = _point_db(monkeypatch, tmp_path)
 
@@ -259,6 +272,38 @@ def test_unacked_failure_still_alerts(monkeypatch, tmp_path):
     rows = inc.list_incidents()
     assert len(rows) == 1
     assert rows[0]["state"] == "detected"
+
+
+def test_no_agent_runner_suppressed_duplicate_does_not_repage(monkeypatch, tmp_path):
+    inc = _point_db(monkeypatch, tmp_path)
+    deliveries = []
+    job = _job(
+        id="nested-runner", no_agent=True, script="jobrun.py",
+        deliver="telegram:room",
+    )
+    marker = (
+        "Script exited with code 3\nstdout:\n"
+        "(suppressed: duplicate of an open condition (occurrence 43))"
+    )
+
+    def fake_deliver(_job, content, adapters=None, loop=None, **_kwargs):
+        deliveries.append(content)
+        return None
+
+    with cron_jobs.use_cron_store(tmp_path), \
+         patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+         patch("cron.scheduler._run_job_script_with_claim_heartbeat",
+               return_value=(False, marker)), \
+         patch.object(sched, "_deliver_result", side_effect=fake_deliver):
+        cron_jobs.save_jobs([job])
+        sched.run_one_job(dict(job))
+
+    assert deliveries == []
+    rows = inc.list_incidents()
+    assert len(rows) == 1
+    assert rows[0]["job_id"] == "nested-runner"
 
 
 def test_ack_suppresses_alert_until_signature_changes(monkeypatch, tmp_path):
