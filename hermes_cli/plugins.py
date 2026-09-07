@@ -49,7 +49,7 @@ import sys
 import threading
 import time
 import types
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -449,6 +449,16 @@ _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # After a timeout, suppress re-firing the same callback for this long so a
 # repeatedly invoked hung hook cannot accumulate abandoned daemon threads.
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
+
+# Allow a small amount of legitimate same-callback overlap, but do not admit an
+# unbounded number of daemon workers during the first timeout window.  Two is
+# enough for the concurrent-tool case that exposed the dropped-observer bug;
+# later fires skip until one of those invocations finishes or times out.
+_HOOK_CALLBACK_MAX_IN_FLIGHT = 2
+# 16 = the current maximum parallel tool-call batch (8) with one full batch of
+# headroom for simultaneous sessions. This is deliberately a fixed resource
+# ceiling, not derived from traffic.
+_HOOK_CALLBACK_MAX_PENDING = 16
 
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = (
     "pre_tool_call plugin callback timed out or is still running"
@@ -3264,8 +3274,9 @@ class PluginContext:
                 hook_name,
                 ", ".join(sorted(VALID_HOOKS)),
             )
-        callbacks = self._manager._hooks.setdefault(hook_name, [])
-        callbacks.append(callback)
+        with self._manager._hook_timeout_lock:
+            callbacks = self._manager._hooks.setdefault(hook_name, [])
+            callbacks.append(callback)
         handle = self._track(
             "hook", hook_name,
             lambda: self._manager._remove_callback(
@@ -3657,12 +3668,24 @@ class PluginManager:
         # legitimately invoke the same callback concurrently, so running
         # tokens are tracked independently. Only a token that actually timed
         # out suppresses later fires; an ordinary in-flight callback does not.
-        # This still prevents a stuck policy hook from spawning a new
-        # abandoned daemon thread on every subsequent fire.
+        # Admission is also capped before the first timeout so a burst cannot
+        # spawn one waiting caller/daemon worker per event behind a hung hook.
+        # Excess healthy calls wait on the per-callback semaphore rather than
+        # losing observer evidence.
         self._hook_running_callbacks: Dict[tuple, Set[object]] = {}
         self._hook_timed_out_callbacks: Dict[tuple, Set[object]] = {}
+        self._hook_callback_slots: Dict[tuple, threading.BoundedSemaphore] = {}
+        self._hook_callback_admissions: Dict[
+            tuple, threading.BoundedSemaphore
+        ] = {}
+        # Incremented on unload-all. Queued invocations carry the generation
+        # they were admitted under so a cached entry-point module re-registering
+        # the exact same callable cannot revive pre-reload events.
+        self._hook_generation = 0
         self._hook_timeout_suppressed_until: Dict[tuple, float] = {}
-        self._hook_timeout_lock = threading.Lock()
+        # Re-entrant because registration handles dispose through
+        # _remove_callback(), which participates in the same admission lock.
+        self._hook_timeout_lock = threading.RLock()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
         # Registration handles are kept both per plugin (ownership lookup) and
         # globally (reverse-order teardown for overrides spanning plugins).
@@ -3792,12 +3815,18 @@ class PluginManager:
         key: str,
         callback: Callable,
     ) -> None:
-        callbacks = mapping.get(key)
-        if callbacks is None:
-            return
-        self._remove_identity(callbacks, callback)
-        if not callbacks:
-            mapping.pop(key, None)
+        # Hook callbacks share this mapping with bounded-dispatch admission.
+        # Registration removal and the queued-callback identity recheck must
+        # use one synchronization domain or unload can win between check and
+        # worker launch.
+        lock = self._hook_timeout_lock if mapping is self._hooks else nullcontext()
+        with lock:
+            callbacks = mapping.get(key)
+            if callbacks is None:
+                return
+            self._remove_identity(callbacks, callback)
+            if not callbacks:
+                mapping.pop(key, None)
 
     def _restore_mapping(
         self,
@@ -3960,6 +3989,23 @@ class PluginManager:
             )
 
         found = bool(target_keys or registrations)
+        # Invalidate queued bounded callbacks before any on_unload cleanup can
+        # dispose plugin-owned state. Targeted unload removes the affected hook
+        # registrations under the same lock; unload-all also advances the
+        # generation so a cached entry point cannot revive an old event.
+        hook_registrations = [
+            registration
+            for registration in registrations
+            if registration.kind == "hook" and registration.active
+        ]
+        with self._hook_timeout_lock:
+            if unload_all:
+                self._hook_generation += 1
+            for registration in hook_registrations:
+                registration.dispose()
+            if unload_all:
+                # Clear legacy/manual callbacks with no ledger handle too.
+                self._hooks.clear()
         self._dispose_registrations(registrations)
         self._forget_registrations(registrations)
 
@@ -4028,7 +4074,6 @@ class PluginManager:
             )
             self._ownership_ledger.clear()
             self._plugins.clear()
-            self._hooks.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
@@ -4044,8 +4089,6 @@ class PluginManager:
             self._predeclared_tools.clear()
             self._context_engine = None
             with self._hook_timeout_lock:
-                self._hook_running_callbacks.clear()
-                self._hook_timed_out_callbacks.clear()
                 self._hook_timeout_suppressed_until.clear()
             self._discovered = False
         else:
@@ -5474,7 +5517,6 @@ class PluginManager:
             try:
                 if use_timeout:
                     token = object()
-                    now = time.monotonic()
                     with self._hook_timeout_lock:
                         suppressed_until = self._hook_timeout_suppressed_until.get(
                             callback_key
@@ -5483,7 +5525,8 @@ class PluginManager:
                             self._hook_timed_out_callbacks.get(callback_key)
                         )
                         if (
-                            suppressed_until is not None and suppressed_until > now
+                            suppressed_until is not None
+                            and suppressed_until > time.monotonic()
                         ) or timed_out:
                             logger.warning(
                                 "Hook '%s' callback %s skipped after a real timeout",
@@ -5495,10 +5538,70 @@ class PluginManager:
                             continue
                         if suppressed_until is not None:
                             self._hook_timeout_suppressed_until.pop(callback_key, None)
-                        self._hook_running_callbacks.setdefault(
-                            callback_key, set()
-                        ).add(token)
+                        slots = self._hook_callback_slots.setdefault(
+                            callback_key,
+                            threading.BoundedSemaphore(_HOOK_CALLBACK_MAX_IN_FLIGHT),
+                        )
+                        admissions = self._hook_callback_admissions.setdefault(
+                            callback_key,
+                            threading.BoundedSemaphore(_HOOK_CALLBACK_MAX_PENDING),
+                        )
+                        admitted_generation = self._hook_generation
 
+                    # Bound active + queued callers before any wait. This keeps
+                    # a hung hook from accumulating one blocked gateway caller
+                    # per event during the first timeout window.
+                    if not admissions.acquire(blocking=False):
+                        logger.warning(
+                            "Hook '%s' callback %s skipped at the pending "
+                            "invocation cap (%d)",
+                            hook_name,
+                            callback_name,
+                            _HOOK_CALLBACK_MAX_PENDING,
+                        )
+                        if fail_closed:
+                            results.append(_pre_tool_call_timeout_block())
+                        continue
+
+                    # Queue behind the finite worker budget instead of dropping
+                    # ordinary concurrent observer calls. Healthy admitted calls
+                    # may drain through any number of execution waves. A genuinely
+                    # timed-out worker installs suppression, which wakes queued
+                    # callers on the next bounded poll so a hang retains at most
+                    # the finite admission budget.
+                    refused_after_timeout = False
+                    poll_seconds = min(timeout, 0.05)
+                    while not slots.acquire(timeout=poll_seconds):
+                        with self._hook_timeout_lock:
+                            suppressed_until = (
+                                self._hook_timeout_suppressed_until.get(callback_key)
+                            )
+                            timed_out = bool(
+                                self._hook_timed_out_callbacks.get(callback_key)
+                            )
+                            stale_generation = (
+                                admitted_generation != self._hook_generation
+                            )
+                            if (
+                                suppressed_until is not None
+                                and suppressed_until > time.monotonic()
+                            ) or timed_out or stale_generation:
+                                refused_after_timeout = True
+                                break
+                    if refused_after_timeout:
+                        admissions.release()
+                        logger.warning(
+                            "Hook '%s' callback %s skipped after a real timeout",
+                            hook_name,
+                            callback_name,
+                        )
+                        if fail_closed:
+                            results.append(_pre_tool_call_timeout_block())
+                        continue
+
+                    # A running callback may have timed out while this caller
+                    # waited for a slot. Re-check before launching another
+                    # worker, and release the acquired permit on every refusal.
                     context = contextvars.copy_context()
                     done = threading.Event()
                     outcome: Dict[str, Any] = {}
@@ -5508,6 +5611,8 @@ class PluginManager:
                         _cb: Callable[..., Any] = cb,
                         _key: tuple = callback_key,
                         _token: object = token,
+                        _slots: threading.BoundedSemaphore = slots,
+                        _admissions: threading.BoundedSemaphore = admissions,
                     ) -> None:
                         try:
                             # Route through _invoke_hook_callback so the
@@ -5532,14 +5637,69 @@ class PluginManager:
                                     timed_out_tokens.discard(_token)
                                     if not timed_out_tokens:
                                         self._hook_timed_out_callbacks.pop(_key, None)
+                            _slots.release()
+                            _admissions.release()
                             done.set()
 
-                    thread = threading.Thread(
-                        target=_runner,
-                        name=f"hermes-hook-{callback_name}"[:40],
-                        daemon=True,
-                    )
-                    thread.start()
+                    with self._hook_timeout_lock:
+                        suppressed_until = self._hook_timeout_suppressed_until.get(
+                            callback_key
+                        )
+                        timed_out = bool(
+                            self._hook_timed_out_callbacks.get(callback_key)
+                        )
+                        still_registered = any(
+                            registered is cb
+                            for registered in self._hooks.get(hook_name, ())
+                        )
+                        same_generation = admitted_generation == self._hook_generation
+                        if (
+                            (
+                                suppressed_until is not None
+                                and suppressed_until > time.monotonic()
+                            )
+                            or timed_out
+                            or not still_registered
+                            or not same_generation
+                        ):
+                            slots.release()
+                            admissions.release()
+                            logger.warning(
+                                "Hook '%s' callback %s skipped after a real timeout "
+                                "or callback unload",
+                                hook_name,
+                                callback_name,
+                            )
+                            if fail_closed:
+                                results.append(_pre_tool_call_timeout_block())
+                            continue
+                        self._hook_running_callbacks.setdefault(
+                            callback_key, set()
+                        ).add(token)
+                        thread = threading.Thread(
+                            target=_runner,
+                            name=f"hermes-hook-{callback_name}"[:40],
+                            daemon=True,
+                        )
+                        try:
+                            # Still under _hook_timeout_lock: unload cannot
+                            # dispose this callback after the identity check
+                            # but before the worker owns its resources.
+                            thread.start()
+                        except Exception:
+                            # No worker exists to run _runner's finally block.
+                            running_tokens = self._hook_running_callbacks.get(
+                                callback_key
+                            )
+                            if running_tokens is not None:
+                                running_tokens.discard(token)
+                                if not running_tokens:
+                                    self._hook_running_callbacks.pop(
+                                        callback_key, None
+                                    )
+                            slots.release()
+                            admissions.release()
+                            raise
                     if not done.wait(timeout=timeout):
                         # Do not join — that would reintroduce the #6622 hang.
                         with self._hook_timeout_lock:
