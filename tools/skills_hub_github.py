@@ -11,7 +11,7 @@ from urllib.parse import quote
 import httpx
 
 from hermes_cli._subprocess_compat import windows_hide_flags
-from tools.skills_guard import TRUSTED_REPOS
+from tools.skills_guard import _all_trusted_repos
 from tools.skills_hub_models import (
     SkillBundle, SkillMeta, SkillSource, _cache_metas, _cached_metas, _dedupe_by_trust,
     _hermes_tags, _matches_query, _parse_frontmatter, _referenced_support_paths,
@@ -202,7 +202,7 @@ class GitHubSource(SkillSource):
     def trust_level_for(self, identifier: str) -> str:
         # identifier format: "owner/repo/path/to/skill"
         parts = identifier.split("/", 2)
-        return "trusted" if len(parts) >= 2 and f"{parts[0]}/{parts[1]}" in TRUSTED_REPOS else "community"
+        return "trusted" if len(parts) >= 2 and f"{parts[0]}/{parts[1]}" in _all_trusted_repos() else "community"
 
     def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
         """Substring-match all taps; dedupe by identifier preferring higher trust."""
