@@ -118,7 +118,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
-        run_still_current: Optional[Callable[[], bool]] = None):
+        run_still_current: Optional[Callable[[], bool]] = None,
+        on_commentary_sent: Optional[Callable[[str], Any]] = None):
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
@@ -127,6 +128,17 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # tool-progress bubble goes BELOW it); on_before_finalize once (pause typing).
         self._on_new_message = on_new_message
         self._on_before_finalize = on_before_finalize
+        # Fired with the platform message_id of a COMMENTARY bubble created by
+        # ``_send_commentary`` — that call site and no other. Tool progress,
+        # heartbeat, and status bubbles are registered inline by the gateway and
+        # must NOT be routed through here, or they would be queued for deletion
+        # twice. The gateway feeds these ids into the same cleanup set so
+        # ``display.platforms.<plat>.cleanup_progress: true`` removes commentary
+        # after the final answer lands instead of stranding it.
+        self._on_commentary_sent = on_commentary_sent
+        # (visible_text, message_id) per commentary bubble sent this turn, held
+        # until the turn's final text is known. See release_transient_ids.
+        self._transient_candidates: "list[tuple[str, str]]" = []
         self._initial_reply_to_id = initial_reply_to_id
         self._turn_id = str(uuid.uuid4())  # keys send_stream_frame() per concurrent consumer
         # Returns False after /new or /stop; run() then abandons the stream.
@@ -417,6 +429,48 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 self._on_new_message()
         except Exception:
             logger.debug("on_new_message callback error", exc_info=True)
+
+    def _notify_commentary_sent(self, message_id: Optional[str]) -> None:
+        """Report a commentary bubble's id for cleanup_progress tracking.
+
+        Mirrors :meth:`_notify_new_message`: best-effort and never raises, so a
+        cleanup-bookkeeping failure cannot break message delivery. Falsy ids are
+        ignored — an adapter that reports success without a usable message id
+        (or one whose platform has no deletion support) simply isn't trackable.
+        """
+        cb = self._on_commentary_sent
+        if cb is None or not message_id:
+            return
+        try:
+            cb(str(message_id))
+        except Exception:
+            logger.debug("on_commentary_sent callback error", exc_info=True)
+
+    def release_transient_ids(self, final_text: str) -> None:
+        """Release held commentary bubble ids for deletion, minus the final answer.
+
+        Called by the gateway once the turn's real final response is known.
+
+        Commentary is normally throwaway ("I'll check the logs now…"), but the
+        interim path can also deliver the turn's actual answer — in which case
+        the gateway suppresses the normal final send and that bubble becomes the
+        ONLY copy the user has. Deleting it would blank the turn. Any candidate
+        whose visible text matches the final response is therefore dropped from
+        the cleanup set rather than reported.
+
+        Safe to call more than once; the held list is cleared on first use.
+        """
+        held, self._transient_candidates = self._transient_candidates, []
+        if not held:
+            return
+        target = self._clean_for_display(final_text or "").strip()
+        for text, message_id in held:
+            if not message_id:
+                continue
+            if target and text == target:
+                # This bubble carries the final answer — keep it.
+                continue
+            self._notify_commentary_sent(message_id)
 
     @staticmethod
     def _signal_flush(flush_event) -> None:

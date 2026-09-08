@@ -724,9 +724,9 @@ class TurnRunner:
         """Status adapter present and this run is still the current generation."""
         return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
 
-    def _send_status_text(self, text: str, metadata, log_message: str) -> None:
+    def _send_status_text(self, text: str, metadata, log_message: str):
         ctx = self._ctx
-        self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+        return self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:
         """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
@@ -813,6 +813,12 @@ class TurnRunner:
                         ),
                         on_before_finalize=pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
+                        # Track interim commentary bubbles so cleanup_progress deletes them with
+                        # the other transient chatter. Gated on the flag so behaviour is
+                        # unchanged when it is off (the default).
+                        on_commentary_sent=(
+                            (lambda mid: ctx._cleanup_msg_ids.append(mid)) if ctx._cleanup_progress else None
+                        ),
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
             except Exception as err:
@@ -832,7 +838,22 @@ class TurnRunner:
             if stream_consumer is not None:
                 stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)
             elif not already_streamed and ctx._status_adapter and str(text or "").strip():
-                self._send_status_text(text, ctx._status_thread_metadata, "interim_assistant_callback scheduling error")
+                _fut = self._send_status_text(text, ctx._status_thread_metadata, "interim_assistant_callback scheduling error")
+                # Sibling of the consumer-path commentary fix: with no stream consumer,
+                # commentary is sent directly here and would otherwise never be registered
+                # for cleanup, so cleanup_progress would still strand it. Held as a
+                # (text, id) candidate exactly like the consumer path so the final-answer
+                # guard applies — this bubble can also BE the answer.
+                if ctx._cleanup_progress and _fut is not None:
+                    def _hold_interim_id(fut, _text=text) -> None:
+                        try:
+                            res = fut.result()
+                        except Exception:
+                            return
+                        mid = getattr(res, "message_id", None)
+                        if getattr(res, "success", False) and mid:
+                            ctx._interim_fallback_candidates.append((str(_text).strip(), str(mid)))
+                    _fut.add_done_callback(_hold_interim_id)
 
         return stream_consumer, stream_delta_cb, interim_assistant_cb, want_interim_messages
 

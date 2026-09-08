@@ -1488,3 +1488,184 @@ class TestFlushPendingSync:
         consumer.finish()
         await task
 
+
+
+class TestTransientCommentaryTracking:
+    """Interim commentary bubbles must be registered for cleanup_progress.
+
+    Regression guard for the gap where tool-progress, heartbeat, and status
+    bubbles were deleted after the final answer while every interim
+    "I'll check X now..." commentary message stayed in the chat forever.
+    """
+
+    @pytest.mark.asyncio
+    async def test_commentary_id_reported_to_callback(self):
+        """A successful commentary send reports its message_id."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_42")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        seen: list[str] = []
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", on_commentary_sent=seen.append
+        )
+        assert await consumer._send_commentary("Checking the logs now")
+        # Held until the final text is known, then released.
+        assert seen == []
+        consumer.release_transient_ids("a totally different final answer")
+        assert seen == ["msg_42"]
+
+    @pytest.mark.asyncio
+    async def test_failed_send_reports_nothing(self):
+        """A failed commentary send must not register an id for deletion."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=False, message_id=None)
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        seen: list[str] = []
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", on_commentary_sent=seen.append
+        )
+        assert not await consumer._send_commentary("Checking the logs now")
+        consumer.release_transient_ids("final answer")
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_success_without_message_id_is_ignored(self):
+        """Adapters reporting success but no usable id are simply untrackable."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id=None)
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        seen: list[str] = []
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", on_commentary_sent=seen.append
+        )
+        await consumer._send_commentary("Checking the logs now")
+        consumer.release_transient_ids("final answer")
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_callback_exception_never_breaks_delivery(self):
+        """Cleanup bookkeeping must never break the user-visible message."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_7")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        def boom(_mid):
+            raise RuntimeError("cleanup tracking exploded")
+
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", on_commentary_sent=boom
+        )
+        # Delivery still succeeds and the text is still recorded.
+        assert await consumer._send_commentary("Checking the logs now")
+        assert consumer._delivered_commentary_texts == ["Checking the logs now"]
+        # A raising callback must not propagate out of the release either.
+        consumer.release_transient_ids("final answer")
+
+    @pytest.mark.asyncio
+    async def test_no_callback_is_the_default(self):
+        """Without the callback (cleanup_progress off) behaviour is unchanged."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_9")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+        assert await consumer._send_commentary("Checking the logs now")
+        assert consumer._delivered_commentary_texts == ["Checking the logs now"]
+
+    @pytest.mark.asyncio
+    async def test_commentary_carrying_final_answer_is_never_deleted(self):
+        """DATA LOSS GUARD: the bubble holding the final answer must survive.
+
+        The interim path can deliver the turn's actual answer, in which case
+        run.py suppresses the normal final send (#14238) and that bubble is the
+        only copy the user has. Deleting it would blank the turn.
+        """
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_final")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        seen: list[str] = []
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", on_commentary_sent=seen.append
+        )
+        answer = "The deploy finished at 14:02 and all checks passed."
+        await consumer._send_commentary(answer)
+        consumer.release_transient_ids(answer)
+
+        assert seen == [], "final-answer bubble must NOT be queued for deletion"
+
+    @pytest.mark.asyncio
+    async def test_mixed_turn_deletes_chatter_keeps_answer(self):
+        """Throwaway commentary is deleted; the answer-bearing bubble is kept."""
+        adapter = MagicMock()
+        ids = iter(["msg_1", "msg_2", "msg_final"])
+        adapter.send = AsyncMock(
+            side_effect=lambda **kw: SimpleNamespace(success=True, message_id=next(ids))
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        seen: list[str] = []
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", on_commentary_sent=seen.append
+        )
+        answer = "All 12 gateways are healthy."
+        await consumer._send_commentary("Checking the fleet now")
+        await consumer._send_commentary("Reading the last health report")
+        await consumer._send_commentary(answer)
+        consumer.release_transient_ids(answer)
+
+        assert seen == ["msg_1", "msg_2"]
+        assert "msg_final" not in seen
+
+    @pytest.mark.asyncio
+    async def test_release_is_idempotent(self):
+        """A second release must not re-report ids (double-delete safety)."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_5")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        seen: list[str] = []
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", on_commentary_sent=seen.append
+        )
+        await consumer._send_commentary("Working on it")
+        consumer.release_transient_ids("different final")
+        consumer.release_transient_ids("different final")
+        assert seen == ["msg_5"]
+
+    @pytest.mark.asyncio
+    async def test_never_released_means_never_deleted(self):
+        """If the turn dies before release, nothing is queued for deletion.
+
+        Failing closed matters: an interrupted or failed run should leave its
+        bubbles in place as breadcrumbs rather than deleting them blind.
+        """
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_8")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        seen: list[str] = []
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", on_commentary_sent=seen.append
+        )
+        await consumer._send_commentary("Starting work")
+        assert seen == []

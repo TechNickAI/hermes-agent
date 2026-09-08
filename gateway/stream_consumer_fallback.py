@@ -17,6 +17,10 @@ logger = logging.getLogger("gateway.stream_consumer")
 class StreamFallbackMixin:
     """Non-streaming delivery paths used once progressive edits fail or the turn ends oddly."""
 
+    # Owned by GatewayStreamConsumer.__init__; declared for the type checker because
+    # _send_commentary holds (text, message_id) pairs here for cleanup_progress.
+    _transient_candidates: "list[tuple[str, str]]"
+
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str], *,
                               final: bool = False) -> Optional[str]:
         """Send a new chunk threaded to ``reply_to_id``; returns the new message_id."""
@@ -335,6 +339,20 @@ class StreamFallbackMixin:
                 # actually carried the final response, vs. unrelated commentary delivered during a session
                 # split (#14238).
                 self._delivered_commentary_texts.append(text)
+                # Hold the bubble for cleanup_progress deletion, but ONLY after
+                # recording the text above — and remember the pairing.
+                #
+                # DATA-LOSS GUARD: commentary can legitimately BE the final
+                # answer. When the interim callback already delivered the exact
+                # final text, the gateway suppresses the normal final send
+                # (already_sent, via has_delivered_text/#14238). Deleting that
+                # bubble afterwards would erase the only copy of the answer and
+                # leave the user with an empty turn. So the id is held against
+                # its text and released for deletion only once the turn's real
+                # final text is known not to match it.
+                _mid = getattr(result, "message_id", None)
+                if _mid:
+                    self._transient_candidates.append((text.strip(), str(_mid)))
             return result.success
         except Exception as e:
             logger.error("Commentary send error: %s", e)
