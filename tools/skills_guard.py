@@ -23,6 +23,47 @@ SCANNER_VERSION = "skills-guard-v2"
 # NVIDIA-verified skills each ship a signed `skill.oms.sig` + governance `skill-card.md`.
 TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "huggingface/skills", "NVIDIA/skills"}
 
+
+def _config_trusted_repos() -> set:
+    """Operator-declared trusted skill repos from config (`skills.trusted_repos`).
+
+    Without this, a first-party library can never be installed: an ops skill that
+    legitimately reads `os.environ.get("XAI_API_KEY")` scores `dangerous`, and
+    dangerous+community is an unconditional block that `--force` cannot override.
+    The only escape was editing this module, so every operator running their own
+    skill repo had to patch the framework.
+
+    This widens WHO you trust, not WHAT is allowed: a trusted repo still cannot
+    install a `dangerous` skill (see INSTALL_POLICY), it moves out of the
+    community tier so `caution` findings stop being fatal. Config, not env, per
+    the project's "secrets in .env, behavior in config.yaml" rule.
+
+    `hermes config set` can store a list as a JSON string, so a str value is
+    parsed as JSON before falling back to treating it as a single repo.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        raw = cfg_get(load_config(), "skills", "trusted_repos", default=[]) or []
+    except Exception:
+        return set()
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.startswith("["):
+            try:
+                import json as _json
+                parsed = _json.loads(text)
+                raw = parsed if isinstance(parsed, list) else [text]
+            except ValueError:
+                raw = [text]
+        else:
+            raw = [text]
+    return {str(r).strip() for r in raw if str(r).strip()}
+
+
+def _all_trusted_repos() -> set:
+    """Built-in trusted repos unioned with operator-declared ones."""
+    return TRUSTED_REPOS | _config_trusted_repos()
+
 INSTALL_POLICY = {
     #                  safe      caution    dangerous
     "builtin":       ("allow",  "allow",   "allow"),
@@ -391,9 +432,68 @@ def _compute_docstring_lines(lines: list) -> set:
     return doc_lines
 
 
+# Categories whose threat lives in the PROSE itself, so they are never demoted by
+# the markdown code-block rule.
+#
+#   injection / obfuscation -- a skill's text is fed to the model as instructions,
+#     so "ignore previous instructions" IS the payload, not a description of one.
+#   persistence -- upstream's `_prose_modify_re` family is PURPOSE-BUILT to catch
+#     imperative prose ("Write the override key into .hermes/config.yaml",
+#     "Update .claude/settings.json to allow all tools"). Those patterns only fire
+#     on modification language, and demoting them would defeat the exact detection
+#     they exist for. Bare path MENTIONS score the separate low-severity
+#     `*_config_ref` patterns, which is where the false-positive relief comes from.
+_PROSE_IS_THE_PAYLOAD = {"injection", "obfuscation", "persistence"}
+
+# `critical` findings are never demoted either. Those patterns (the `_shell` family:
+# redirect / sed -i / tee / cp / mv against an agent-config file, curl|sh, reverse
+# shells) already encode an ACTION, not a mention -- the regex itself is the proof of
+# intent, so an unfenced `cat x | tee -a .cursorrules` in a SKILL.md is a real attack
+# whether or not the author wrapped it in backticks. Demoting on fencing alone would
+# let an attacker downgrade a critical finding by simply not using a code block.
+_DEMOTED_SEVERITY = {"high": "medium", "medium": "low", "low": "low"}
+
+
+def _markdown_code_line_numbers(lines: list) -> set:
+    """1-based line numbers inside fenced code blocks of a markdown document.
+
+    A skill's SKILL.md is mostly PROSE that describes commands. The sentence
+    "read ``~/.hermes/config.yaml`` before selecting a model" is documentation;
+    a shell line ``echo x >> ~/.hermes/config.yaml`` is an action. The threat
+    patterns cannot tell them apart, so scanning markdown as if every line were
+    executable makes ordinary docs score ``dangerous`` -- a verdict ``--force``
+    cannot override, which is what blocked our own reviewed skills from
+    installing at all.
+
+    Fenced blocks (``` or ~~~, any info string) and four-space-indented blocks
+    are treated as code and scanned at full severity. Everything else is prose.
+    Inline single-backtick spans are NOT code for this purpose: that is exactly
+    how docs quote a path or command while telling you not to run it.
+    """
+    code_lines: set = set()
+    fence: str | None = None
+    for idx, line in enumerate(lines, start=1):
+        stripped = line.lstrip()
+        if fence is None:
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                fence = stripped[:3]
+                code_lines.add(idx)
+            elif line.startswith("    ") and line.strip():
+                code_lines.add(idx)  # four-space indented block
+            continue
+        code_lines.add(idx)  # inside a fence: everything is code
+        if stripped.startswith(fence):
+            fence = None
+    return code_lines
+
+
 def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     """Threat-pattern + invisible-unicode scan of one file; *rel_path* is the display path (default: file
-    name). Regex findings dedupe per pattern per line; invisible chars yield one per line."""
+    name). Regex findings dedupe per pattern per line; invisible chars yield one per line.
+
+    For markdown, findings on PROSE lines (outside fenced/indented code blocks) are demoted one
+    severity step and labelled, because prose that merely NAMES a sensitive path is documentation,
+    not an action. Injection and obfuscation are never demoted (see _PROSE_IS_THE_PAYLOAD)."""
     rel_path = rel_path or file_path.name
     if file_path.suffix.lower() not in SCANNABLE_EXTENSIONS and file_path.name != "SKILL.md":
         return []
@@ -403,12 +503,19 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
         return []
     findings = []
     docstring_lines = _compute_docstring_lines(lines)  # so code patterns don't fire on prose
+    is_markdown = file_path.suffix.lower() in {".md", ".markdown"} or file_path.name == "SKILL.md"
+    code_lines = _markdown_code_line_numbers(lines) if is_markdown else None
     for pattern, pid, severity, category, description in _COMPILED_THREAT_PATTERNS:
         for i, line in enumerate(lines, start=1):
             if i not in docstring_lines and pattern.search(line):
                 text = line.strip()
-                findings.append(Finding(pid, severity, category, rel_path, i,
-                                        text if len(text) <= 120 else text[:117] + "...", description))
+                eff_severity, eff_description = severity, description
+                if (code_lines is not None and i not in code_lines
+                        and category not in _PROSE_IS_THE_PAYLOAD):
+                    eff_severity = _DEMOTED_SEVERITY.get(severity, severity)
+                    eff_description = f"{description} (in prose, not a code block)"
+                findings.append(Finding(pid, eff_severity, category, rel_path, i,
+                                        text if len(text) <= 120 else text[:117] + "...", eff_description))
     for i, line in enumerate(lines, start=1):
         if (char := next((c for c in INVISIBLE_CHARS if c in line), None)) is not None:
             name = _unicode_char_name(char)
@@ -620,7 +727,7 @@ def _resolve_trust_level(source: str) -> str:
         return "agent-created"
     if src == "official":
         return "builtin"
-    return "trusted" if any(src == t or src.startswith(f"{t}/") for t in TRUSTED_REPOS) else "community"
+    return "trusted" if any(src == t or src.startswith(f"{t}/") for t in _all_trusted_repos()) else "community"
 
 
 def _determine_verdict(findings: List[Finding]) -> str:
