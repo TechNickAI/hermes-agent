@@ -256,6 +256,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                         ),
                         on_before_finalize=pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
+                        # Track interim commentary bubbles so cleanup_progress deletes them with
+                        # the other transient chatter. Gated on the flag so behaviour is
+                        # unchanged when it is off (the default).
+                        on_commentary_sent=(
+                            (lambda mid: ctx._cleanup_msg_ids.append(mid)) if ctx._cleanup_progress else None
+                        ),
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
                     # #105341: a consumer created only for interim commentary (text streaming off)
@@ -316,7 +322,22 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if stream_consumer is not None:
                 stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)
             elif not already_streamed and ctx._status_adapter and str(text or "").strip():
-                self._send_status_text(text, ctx._status_thread_metadata, "interim_assistant_callback scheduling error")
+                _fut = self._send_status_text(text, ctx._status_thread_metadata, "interim_assistant_callback scheduling error")
+                # Sibling of the consumer-path commentary fix: with no stream consumer,
+                # commentary is sent directly here and would otherwise never be registered
+                # for cleanup, so cleanup_progress would still strand it. Held as a
+                # (text, id) candidate exactly like the consumer path so the final-answer
+                # guard applies — this bubble can also BE the answer.
+                if ctx._cleanup_progress and _fut is not None:
+                    def _hold_interim_id(fut, _text=text) -> None:
+                        try:
+                            res = fut.result()
+                        except Exception:
+                            return
+                        mid = getattr(res, "message_id", None)
+                        if getattr(res, "success", False) and mid:
+                            ctx._interim_fallback_candidates.append((str(_text).strip(), str(mid)))
+                    _fut.add_done_callback(_hold_interim_id)
 
         return stream_consumer, stream_delta_cb, interim_assistant_cb, want_interim_messages
 
