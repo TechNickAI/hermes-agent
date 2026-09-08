@@ -3339,6 +3339,7 @@ SuccessExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}
 KillMode=mixed
 KillSignal=SIGTERM
+LimitNOFILE=65536
 ExecReload=/bin/kill -USR1 $MAINPID
 ExecStop=-{_systemd_command(stop_mark)}
 ExecStopPost=-{_systemd_command(cleanup)}
