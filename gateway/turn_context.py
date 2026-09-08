@@ -8,7 +8,7 @@ single-element lists so mutation stays visible to the outer body.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 
 @dataclass
@@ -34,6 +34,10 @@ class TurnContext:
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
     _cleanup_msg_ids: List[str] = field(default_factory=list)
+    # (visible_text, message_id) for commentary sent on the no-stream-consumer fallback
+    # path, held until the turn's final text is known so a bubble that carried the answer
+    # is never deleted. Released in _run_agent_release_untracked_commentary.
+    _interim_fallback_candidates: List[Tuple[str, str]] = field(default_factory=list)
     _progress_metadata: Optional[dict] = None
     _progress_reply_to: Optional[Any] = None
     message: Optional[str] = None  # the only rebindable field

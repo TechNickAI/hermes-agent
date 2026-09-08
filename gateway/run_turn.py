@@ -3648,6 +3648,34 @@ class GatewayTurnMixin:
                 _sk, _streamed, _previewed, _content_delivered, _transformed, len(_final),
             )
 
+    def _run_agent_release_untracked_commentary(self, response: Any, turn_ctx: TurnContext) -> None:
+        """Release held interim-commentary bubble ids into the cleanup set.
+
+        Runs once the turn's real final text is known. A commentary bubble that actually
+        carried the final answer is withheld: the gateway may have suppressed the normal
+        final send on the strength of it (#14238), so deleting it would leave the user with
+        an empty turn. Covers both delivery paths — the stream consumer holds its own
+        candidates, the no-consumer fallback holds them on the turn context.
+        """
+        if not turn_ctx._cleanup_progress:
+            return
+        _final = (response.get("final_response") or "") if isinstance(response, dict) else ""
+        _sc = turn_ctx.stream_consumer_holder[0]
+        if _sc is not None:
+            try:
+                _sc.release_transient_ids(_final)
+            except Exception as _rel_err:
+                logger.debug("Transient id release failed: %s", _rel_err)
+        try:
+            _held = list(turn_ctx._interim_fallback_candidates)
+            turn_ctx._interim_fallback_candidates.clear()
+            _tgt = str(_final or "").strip()
+            for _text, _mid in _held:
+                if _mid and not (_tgt and _text == _tgt):
+                    turn_ctx._cleanup_msg_ids.append(_mid)
+        except Exception as _rel_err2:
+            logger.debug("Interim fallback id release failed: %s", _rel_err2)
+
     def _run_agent_schedule_bubble_cleanup(self, response: Any, _cleanup_adapter: Any, turn_ctx: TurnContext) -> None:
         """Schedule deletion of tracked temporary progress bubbles after the final response lands.
 
@@ -3853,5 +3881,6 @@ class GatewayTurnMixin:
             )
 
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
+        self._run_agent_release_untracked_commentary(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
         return response
