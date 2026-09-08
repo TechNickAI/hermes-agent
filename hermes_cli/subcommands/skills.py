@@ -167,8 +167,14 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     tap_subparsers.add_parser("list", help="List configured taps")
     tap_add = tap_subparsers.add_parser("add", help="Add a GitHub repo as skill source")
     tap_add.add_argument("repo", help="GitHub repo (e.g. owner/repo)")
+    tap_add.add_argument("--path", default=None,
+                         help="Repo-relative dir holding the skills (default: skills/). "
+                              "One repo can serve several packs, e.g. skills/.curated/")
     tap_rm = tap_subparsers.add_parser("remove", help="Remove a tap")
     tap_rm.add_argument("name", help="Tap name to remove")
+    tap_rm.add_argument("--path", default=None,
+                        help="Remove only the tap at this path; omit to remove every "
+                             'tap for the repo. Pass --path "" for the repo-root tap.')
 
     # config sub-action: interactive enable/disable
     skills_subparsers.add_parser(
