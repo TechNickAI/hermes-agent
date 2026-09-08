@@ -223,7 +223,7 @@ _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # Longer server penalties fail closed with a ``flood_control:{wait}`` SendResult so the caller's retry
 # machinery (delivery ledger, streaming fallback) owns the wait instead of the coroutine pinning its worker
 # — a 97-minute penalty on the boot path froze inbound on every platform (#91969).
-_FLOOD_INLINE_WAIT_CAP_SECS = 5.0
+_FLOOD_INLINE_WAIT_CAP_SECS = 20.0
 
 # Shared per-chat outbound budget (#116312): Telegram counts an editMessageText against the
 # SAME per-chat allowance as a sendMessage, but streaming previews used to pace only edits at
