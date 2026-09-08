@@ -1013,12 +1013,12 @@ class GatewayTurnProgressMixin:
         """Status adapter present and this run is still the current generation."""
         return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
 
-    def _send_status_text(self, text: str, metadata, log_message: str) -> None:
+    def _send_status_text(self, text: str, metadata, log_message: str):
         from gateway.bot_peer_notices import automatic_notices_allowed
         ctx = self._ctx
         if not automatic_notices_allowed(ctx.source):
-            return
-        self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+            return None
+        return self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:
         """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
