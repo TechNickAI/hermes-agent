@@ -1078,8 +1078,14 @@ _TAP_OPS = {
 }
 
 
-def do_tap(action: str, repo: str = "", console: Optional[Console] = None) -> None:
-    """Manage taps (custom GitHub repo sources)."""
+def do_tap(action: str, repo: str = "", console: Optional[Console] = None,
+           path: Optional[str] = None) -> None:
+    """Manage taps (custom GitHub repo sources).
+
+    `path` is None when the flag was not given. On remove that means "every tap
+    for this repo"; an explicit "" means the repo-root tap only, so it must not
+    be collapsed into None by a falsy check.
+    """
     from tools.skills_hub import TapsManager
     c = console or _console
     mgr = TapsManager()
@@ -1097,9 +1103,19 @@ def do_tap(action: str, repo: str = "", console: Optional[Console] = None) -> No
     elif action in _TAP_OPS:
         method, ok_line, fail_line = _TAP_OPS[action]
         if not repo:
-            _print_error(c, f"Repo required. Usage: hermes skills tap {action} owner/repo")
+            _print_error(
+                c, f"Repo required. Usage: hermes skills tap {action} owner/repo [--path skills/core/]")
             return
-        c.print((ok_line if getattr(mgr, method)(repo) else fail_line).format(repo=repo))
+        try:
+            if action == "add":
+                ok = mgr.add(repo, path if path is not None else "skills/")
+            else:
+                ok = mgr.remove(repo, path)
+        except ValueError as e:
+            _print_error(c, str(e))
+            return
+        label = f"{repo} [dim]({path})[/]" if path is not None else repo
+        c.print((ok_line if ok else fail_line).format(repo=label))
     else:
         c.print(f"[bold red]Unknown tap action:[/] {action}. Use: list, add, remove\n")
 
@@ -1303,7 +1319,13 @@ def _tap_cli(args) -> None:
     if not tap_action:
         _console.print("Usage: hermes skills tap [list|add|remove]\n")
         return
-    do_tap(tap_action, repo=getattr(args, "repo", "") or getattr(args, "name", ""))
+    # getattr default is None, NOT "" -- an explicit `--path ""` means the
+    # repo-root tap, while an omitted flag means "unspecified".
+    do_tap(
+        tap_action,
+        repo=getattr(args, "repo", "") or getattr(args, "name", ""),
+        path=getattr(args, "path", None),
+    )
 
 
 # `hermes skills <action>` -> handler(args). Lambdas late-bind the do_* names so

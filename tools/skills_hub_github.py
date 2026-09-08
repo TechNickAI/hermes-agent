@@ -317,7 +317,21 @@ class GitHubSource(SkillSource):
     # -- Internal helpers --
 
     def _list_skills_in_repo(self, repo: str, path: str) -> List[SkillMeta]:
-        """List skill directories in a GitHub repo path, using cached index."""
+        """List skill directories in a GitHub repo path, using cached index.
+
+        The path is validated HERE, not only where taps are added. taps.json is an
+        ordinary file on disk that a user, a sync process, or an attacker with write
+        access can edit directly, and ".." segments are resolved by the HTTP client
+        BEFORE the request is sent -- silently retargeting the fetch at a different
+        repository. Skills fetched this way become agent instructions, so this is the
+        enforcement point that actually matters.
+        """
+        from tools.skills_hub import _normalize_tap_path
+        try:
+            path = _normalize_tap_path(path)
+        except (ValueError, TypeError) as e:
+            logger.warning("Refusing unsafe tap path for %s: %s", repo, e)
+            return []
         cache_key = f"{repo}_{path}".replace("/", "_").replace(" ", "_")
         cached = _cached_metas(cache_key)
         if cached is not None:
