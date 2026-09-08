@@ -250,6 +250,52 @@ class HubLockFile(_JsonStateFile):
         return [{"name": name, **entry} for name, entry in self.load()["installed"].items()]
 
 
+def _normalize_tap_path(path: str) -> str:
+    """Canonical, SAFE form of a tap's repo-relative path.
+
+    Taps are identified by (repo, path), so "skills", "skills/", "/skills/",
+    "skills//core" and "./skills/core" must all compare equal or the same
+    subscription registers twice: double API calls, every skill listed twice,
+    and identifiers too different for the downstream dedupe to collapse.
+    Returns a slash-suffixed form; the repo root normalizes to "".
+
+    SECURITY: rejects path traversal and absolute URLs. The path is interpolated
+    into the GitHub contents URL and httpx resolves ".." BEFORE sending, so a tap
+    naming one repo could silently fetch another. Skills become agent
+    instructions, so a redirected source is a prompt-injection vector. Rejected
+    here AND at the fetch site, because taps.json is a plain file that can be
+    hand-edited without ever calling add().
+    """
+    if not isinstance(path, str):
+        raise ValueError(f"tap path must be a string, got {type(path).__name__}")
+    text = path.strip()
+    lowered = text.lower()
+    if "://" in text or lowered.startswith(("http:", "https:", "//")):
+        raise ValueError(f"tap path must be repo-relative, not a URL: {path!r}")
+    if "\\" in text:
+        raise ValueError(f"tap path must use forward slashes: {path!r}")
+    segments = [s for s in text.split("/") if s not in ("", ".")]
+    if any(s == ".." for s in segments):
+        raise ValueError(f"tap path must not contain '..': {path!r}")
+    return f"{'/'.join(segments)}/" if segments else ""
+
+
+def _tap_matches(tap: dict, repo: str, path: str) -> bool:
+    """Whether a stored tap entry is the same (repo, path) subscription.
+
+    A legacy entry with no "path" key predates per-path taps. The fetcher reads a
+    missing path as the repo ROOT, so it must normalize to "" here too -- defaulting
+    it to "skills/" would make add() refuse a tap that does not actually exist.
+    """
+    if tap.get("repo") != repo:
+        return False
+    try:
+        stored = _normalize_tap_path(tap.get("path", ""))
+    except (ValueError, TypeError):
+        return False
+    return stored == path
+
+
 class TapsManager(_JsonStateFile):
     """skills/.hub/taps.json — custom GitHub repo sources."""
 
@@ -263,18 +309,34 @@ class TapsManager(_JsonStateFile):
         self._write({"taps": taps})
 
     def add(self, repo: str, path: str = "skills/") -> bool:
-        """Add a tap. Returns False if already exists."""
+        """Add a tap. Returns False if an identical (repo, path) tap exists.
+
+        Taps are identified by (repo, path) so one repo can serve many packs
+        (e.g. openai/skills publishes both skills/.curated/ and skills/.system/).
+        Raises ValueError on an unsafe path -- see _normalize_tap_path.
+        """
+        path = _normalize_tap_path(path)
         taps = self.load()
-        if any(t["repo"] == repo for t in taps):
+        if any(_tap_matches(t, repo, path) for t in taps):
             return False
         taps.append({"repo": repo, "path": path})
         self.save(taps)
         return True
 
-    def remove(self, repo: str) -> bool:
-        """Remove a tap by repo name. Returns False if not found."""
+    def remove(self, repo: str, path: Optional[str] = None) -> bool:
+        """Remove taps for a repo. Returns False if nothing matched.
+
+        `path=None` means "unspecified" and removes EVERY tap for the repo.
+        An explicit path (including "" for the repo root) removes only that one,
+        so `--path ""` must not be coerced to None by a falsy check.
+        """
+        if path is not None:
+            path = _normalize_tap_path(path)
         taps = self.load()
-        new_taps = [t for t in taps if t["repo"] != repo]
+        new_taps = [
+            t for t in taps
+            if not (t["repo"] == repo and (path is None or _tap_matches(t, repo, path)))
+        ]
         if len(new_taps) == len(taps):
             return False
         self.save(new_taps)
