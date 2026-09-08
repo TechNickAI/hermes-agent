@@ -268,7 +268,11 @@ def mount_spa(application: FastAPI):
     mount_preview_assets(application)
     application.mount("/assets", serve_assets, name="assets")
 
-    @application.get("/{full_path:path}")
+    # GET *and* HEAD. Uptime monitors, load balancers, and `curl -I` probe the SPA
+    # with HEAD; Starlette's @get only auto-derives HEAD for StaticFiles mounts, not
+    # for a catch-all route function, so a bare @get returns 405 on every HEAD and a
+    # health check reports the dashboard as down while it is serving fine.
+    @application.api_route("/{full_path:path}", methods=["GET", "HEAD"])
     async def serve_spa(full_path: str, request: Request):
         prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
         # An unmatched /api/* path is a missing endpoint, not a client-side route: return a
