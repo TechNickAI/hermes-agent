@@ -17,6 +17,7 @@ from hermes_cli.plugins import (
     PluginContext,
     PluginManager,
     PluginManifest,
+    PluginRegistration,
     _dispatch_pre_tool_call_hooks,
     get_plugin_command_handler,
     get_plugin_commands,
@@ -1060,6 +1061,565 @@ class TestForceReloadSymmetry:
         assert mgr.invoke_hook("pre_llm_call", session_id="s1") == [
             {"context": "hi"}
         ]
+
+    def test_concurrent_hook_calls_do_not_drop_callback(self, monkeypatch):
+        """Ordinary overlap is not evidence that the first callback hung."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+        )
+
+        both_started = threading.Barrier(2)
+        calls = []
+
+        def callback(**kwargs):
+            calls.append(kwargs["call_id"])
+            both_started.wait(timeout=0.5)
+            return kwargs["call_id"]
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [callback]
+        results = {}
+
+        def invoke(call_id):
+            results[call_id] = mgr.invoke_hook(
+                "post_tool_call", call_id=call_id
+            )
+
+        first = threading.Thread(target=invoke, args=("first",))
+        second = threading.Thread(target=invoke, args=("second",))
+        first.start()
+        second.start()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert sorted(calls) == ["first", "second"]
+        assert results == {"first": ["first"], "second": ["second"]}
+
+    def test_concurrent_hook_calls_are_bounded_before_first_timeout(self, monkeypatch):
+        """A burst behind a hung callback must not create unbounded workers."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.25
+        )
+
+        hold = threading.Event()
+        two_started = threading.Event()
+        starts = []
+
+        def blocker(**kwargs):
+            starts.append(kwargs["call_id"])
+            if len(starts) == 2:
+                two_started.set()
+            hold.wait(timeout=10.0)
+            return kwargs["call_id"]
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [blocker]
+        callers = [
+            threading.Thread(
+                target=mgr.invoke_hook,
+                args=("post_tool_call",),
+                kwargs={"call_id": i},
+            )
+            for i in range(12)
+        ]
+        for caller in callers:
+            caller.start()
+        assert two_started.wait(timeout=1.0)
+        for caller in callers:
+            caller.join(timeout=1.0)
+
+        assert all(not caller.is_alive() for caller in callers)
+        assert len(starts) == 2
+        hold.set()
+
+    def test_concurrent_hook_pending_queue_is_finite(self, monkeypatch):
+        """The capacity wait itself must not admit one caller per event."""
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.5
+        )
+
+        hold = threading.Event()
+
+        def blocker(**_kwargs):
+            hold.wait(timeout=10.0)
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [blocker]
+        callers = [
+            threading.Thread(target=mgr.invoke_hook, args=("post_tool_call",))
+            for _ in range(40)
+        ]
+        for caller in callers:
+            caller.start()
+        time.sleep(0.1)
+
+        # At most 16 calls may remain admitted (2 active + 14 queued). A test
+        # that reads the implementation constant here would pass if the cap
+        # drifted to 10,000 and would not bind to the resource-safety claim.
+        live_at_peak = sum(caller.is_alive() for caller in callers)
+        assert 2 <= live_at_peak <= 16
+        hold.set()
+        for caller in callers:
+            caller.join(timeout=1.0)
+        assert all(not caller.is_alive() for caller in callers)
+
+    def test_healthy_calls_wait_for_callback_capacity_instead_of_being_dropped(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+        )
+
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+        two_started = threading.Event()
+        release_first_pair = threading.Event()
+
+        def callback(**kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+                if active == 2:
+                    two_started.set()
+            if kwargs["call_id"] in (0, 1):
+                release_first_pair.wait(timeout=0.5)
+            with lock:
+                active -= 1
+            return kwargs["call_id"]
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [callback]
+        results = {}
+
+        def invoke(call_id):
+            results[call_id] = mgr.invoke_hook(
+                "post_tool_call", call_id=call_id
+            )
+
+        callers = [threading.Thread(target=invoke, args=(i,)) for i in range(8)]
+        for caller in callers:
+            caller.start()
+        assert two_started.wait(timeout=1.0)
+        release_first_pair.set()
+        for caller in callers:
+            caller.join(timeout=2.0)
+
+        assert all(not caller.is_alive() for caller in callers)
+        assert max_active == 2
+        assert results == {i: [i] for i in range(8)}
+
+    def test_callback_gets_full_timeout_after_waiting_for_capacity(
+        self, monkeypatch
+    ):
+        """Queue time must not consume the callback's own runtime budget."""
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.3
+        )
+
+        def callback(**kwargs):
+            time.sleep(0.12)
+            return kwargs["call_id"]
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [callback]
+        results = {}
+
+        def invoke(call_id):
+            results[call_id] = mgr.invoke_hook(
+                "post_tool_call", call_id=call_id
+            )
+
+        callers = [threading.Thread(target=invoke, args=(i,)) for i in range(5)]
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join(timeout=1.0)
+
+        assert all(not caller.is_alive() for caller in callers)
+        assert results == {i: [i] for i in range(5)}
+
+    def test_queued_callback_does_not_run_after_unload(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+        )
+
+        release = threading.Event()
+        two_started = threading.Event()
+        calls = []
+
+        def callback(**kwargs):
+            calls.append(kwargs["call_id"])
+            if len(calls) == 2:
+                two_started.set()
+            release.wait(timeout=1.0)
+            return kwargs["call_id"]
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [callback]
+        results = {}
+
+        def invoke(call_id):
+            results[call_id] = mgr.invoke_hook(
+                "post_tool_call", call_id=call_id
+            )
+
+        callers = [threading.Thread(target=invoke, args=(i,)) for i in range(3)]
+        for caller in callers:
+            caller.start()
+        assert two_started.wait(timeout=1.0)
+        mgr._hooks["post_tool_call"].remove(callback)
+        release.set()
+        for caller in callers:
+            caller.join(timeout=2.0)
+
+        assert all(not caller.is_alive() for caller in callers)
+        assert sorted(calls) == [0, 1]
+        assert results[2] == []
+
+    def test_queued_callback_registration_check_uses_identity(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+        )
+
+        release = threading.Event()
+        two_started = threading.Event()
+        calls = []
+
+        class EqualCallback:
+            def __init__(self, name):
+                self.name = name
+
+            def __eq__(self, other):
+                return isinstance(other, EqualCallback)
+
+            def __call__(self, **kwargs):
+                calls.append((self.name, kwargs["call_id"]))
+                if len(calls) == 2:
+                    two_started.set()
+                release.wait(timeout=1.0)
+                return kwargs["call_id"]
+
+        removed = EqualCallback("removed")
+        equal_replacement = EqualCallback("replacement")
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [removed]
+        results = {}
+
+        def invoke(call_id):
+            results[call_id] = mgr.invoke_hook(
+                "post_tool_call", call_id=call_id
+            )
+
+        callers = [threading.Thread(target=invoke, args=(i,)) for i in range(3)]
+        for caller in callers:
+            caller.start()
+        assert two_started.wait(timeout=1.0)
+        mgr._hooks["post_tool_call"] = [equal_replacement]
+        release.set()
+        for caller in callers:
+            caller.join(timeout=2.0)
+
+        assert all(not caller.is_alive() for caller in callers)
+        assert len(calls) == 2
+        assert {name for name, _call_id in calls} == {"removed"}
+        skipped = {0, 1, 2} - {call_id for _name, call_id in calls}
+        assert len(skipped) == 1
+        assert results[skipped.pop()] == []
+
+    def test_worker_launch_and_hook_disposal_share_one_lock(self, monkeypatch):
+        """Unload cannot win after admission but before Thread.start."""
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+        )
+
+        mgr = PluginManager()
+        callback = lambda **_kw: "ok"
+        mgr._hooks["post_tool_call"] = [callback]
+        real_start = threading.Thread.start
+        removal_attempted = threading.Event()
+        removal_done = threading.Event()
+        removers = []
+
+        def remove_callback():
+            removal_attempted.set()
+            mgr._remove_callback(mgr._hooks, "post_tool_call", callback)
+            removal_done.set()
+
+        def start_with_removal_race(worker):
+            remover = threading.Thread(target=remove_callback)
+            removers.append(remover)
+            real_start(remover)
+            assert removal_attempted.wait(timeout=1.0)
+            time.sleep(0.05)
+            assert not removal_done.is_set()
+            return real_start(worker)
+
+        monkeypatch.setattr(threading.Thread, "start", start_with_removal_race)
+        assert mgr.invoke_hook("post_tool_call") == ["ok"]
+        for remover in removers:
+            remover.join(timeout=1.0)
+        assert removal_done.is_set()
+        assert mgr._hooks.get("post_tool_call") is None
+
+    def test_force_reload_cancels_queued_event_even_if_callable_is_reused(
+        self, monkeypatch
+    ):
+        """A cached entry point may re-register the exact same callable."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+        )
+
+        release = threading.Event()
+        two_started = threading.Event()
+        calls = []
+
+        def callback(**kwargs):
+            calls.append(kwargs["call_id"])
+            if len(calls) == 2:
+                two_started.set()
+            release.wait(timeout=1.0)
+            return kwargs["call_id"]
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [callback]
+        results = {}
+
+        def invoke(call_id):
+            results[call_id] = mgr.invoke_hook(
+                "post_tool_call", call_id=call_id
+            )
+
+        callers = [threading.Thread(target=invoke, args=(i,)) for i in range(3)]
+        for caller in callers:
+            caller.start()
+        assert two_started.wait(timeout=1.0)
+        # Wait until the third invocation has actually entered the bounded
+        # admission queue; otherwise the caller may snapshot the new generation
+        # after this synthetic reload and is correctly a new event.
+        import time
+
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            admissions = mgr._hook_callback_admissions.get(
+                ("post_tool_call", id(callback))
+            )
+            if admissions is not None and getattr(admissions, "_value", None) == 13:
+                break
+            time.sleep(0.005)
+        else:
+            pytest.fail("third callback never entered the admission queue")
+        with mgr._hook_timeout_lock:
+            mgr._hook_generation += 1
+            mgr._hooks["post_tool_call"] = [callback]
+        release.set()
+        for caller in callers:
+            caller.join(timeout=2.0)
+
+        assert all(not caller.is_alive() for caller in callers)
+        assert len(calls) == 2
+        skipped = {0, 1, 2} - set(calls)
+        assert len(skipped) == 1
+        assert results[skipped.pop()] == []
+
+    def test_unload_invalidates_queue_before_on_unload_releases_state(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+        )
+
+        release = threading.Event()
+        two_started = threading.Event()
+        cleaned = threading.Event()
+        calls = []
+
+        def callback(**kwargs):
+            assert not cleaned.is_set()
+            calls.append(kwargs["call_id"])
+            if len(calls) == 2:
+                two_started.set()
+            release.wait(timeout=1.0)
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [callback]
+        fake_plugin = type(
+            "FakePlugin",
+            (),
+            {"manifest": type("Manifest", (), {"name": "p"})()},
+        )()
+        mgr._plugins["p"] = fake_plugin
+        hook = PluginRegistration(
+            "hook",
+            "post_tool_call",
+            lambda: mgr._remove_callback(
+                mgr._hooks, "post_tool_call", callback
+            ),
+            plugin_key="p",
+        )
+        cleanup = PluginRegistration(
+            "on_unload",
+            "cleanup",
+            lambda: cleaned.set(),
+            plugin_key="p",
+        )
+        mgr._ownership_ledger["p"] = [hook, cleanup]
+        mgr._registration_order = [hook, cleanup]
+
+        callers = [
+            threading.Thread(
+                target=mgr.invoke_hook,
+                args=("post_tool_call",),
+                kwargs={"call_id": i},
+            )
+            for i in range(3)
+        ]
+        for caller in callers:
+            caller.start()
+        assert two_started.wait(timeout=1.0)
+        assert mgr.unload("p")
+        release.set()
+        for caller in callers:
+            caller.join(timeout=2.0)
+
+        assert cleaned.is_set()
+        assert len(calls) == 2
+
+    def test_force_reload_releases_queued_callers_behind_timed_out_workers(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.12
+        )
+
+        hold = threading.Event()
+        two_started = threading.Event()
+        starts = 0
+
+        def callback(**_kwargs):
+            nonlocal starts
+            starts += 1
+            if starts == 2:
+                two_started.set()
+            hold.wait(timeout=2.0)
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [callback]
+        callers = [
+            threading.Thread(target=mgr.invoke_hook, args=("post_tool_call",))
+            for _ in range(6)
+        ]
+        for caller in callers:
+            caller.start()
+        assert two_started.wait(timeout=1.0)
+        # Let both workers cross their timeout while remaining hung, then
+        # invalidate the queued generation exactly as unload-all does.
+        import time
+
+        time.sleep(0.16)
+        with mgr._hook_timeout_lock:
+            mgr._hook_generation += 1
+            mgr._hooks["post_tool_call"] = [callback]
+            mgr._hook_running_callbacks.clear()
+            mgr._hook_timeout_suppressed_until.clear()
+        for caller in callers:
+            caller.join(timeout=0.5)
+
+        assert all(not caller.is_alive() for caller in callers)
+        assert starts == 2
+        hold.set()
+
+    def test_reload_before_timeout_preserves_hung_worker_marker(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.12
+        )
+
+        hold = threading.Event()
+        two_started = threading.Event()
+        starts = 0
+
+        def callback(**_kwargs):
+            nonlocal starts
+            starts += 1
+            if starts == 2:
+                two_started.set()
+            hold.wait(timeout=2.0)
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [callback]
+        first_pair = [
+            threading.Thread(target=mgr.invoke_hook, args=("post_tool_call",))
+            for _ in range(2)
+        ]
+        for caller in first_pair:
+            caller.start()
+        assert two_started.wait(timeout=1.0)
+        with mgr._hook_timeout_lock:
+            mgr._hook_generation += 1
+            mgr._hooks["post_tool_call"] = [callback]
+        for caller in first_pair:
+            caller.join(timeout=0.5)
+        assert all(not caller.is_alive() for caller in first_pair)
+
+        # Clear the short suppression window to isolate the durable marker.
+        with mgr._hook_timeout_lock:
+            mgr._hook_timeout_suppressed_until.clear()
+        started = __import__("time").monotonic()
+        assert mgr.invoke_hook("post_tool_call") == []
+        elapsed = __import__("time").monotonic() - started
+        assert elapsed < 0.1
+        assert starts == 2
+        hold.set()
+
+    def test_worker_start_failure_releases_callback_capacity(self, monkeypatch):
+        """A failed Thread.start must not strand slots or running tokens."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+        )
+
+        real_start = threading.Thread.start
+        starts = 0
+
+        def fail_twice(thread):
+            nonlocal starts
+            starts += 1
+            if starts <= 2:
+                raise RuntimeError("can't start new thread")
+            return real_start(thread)
+
+        monkeypatch.setattr(threading.Thread, "start", fail_twice)
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [lambda **_kw: "ok"]
+
+        assert mgr.invoke_hook("post_tool_call") == []
+        assert mgr.invoke_hook("post_tool_call") == []
+        assert mgr.invoke_hook("post_tool_call") == ["ok"]
+        assert mgr._hook_running_callbacks == {}
+
+        slots = next(iter(mgr._hook_callback_slots.values()))
+        admissions = next(iter(mgr._hook_callback_admissions.values()))
+        assert slots.acquire(blocking=False)
+        assert slots.acquire(blocking=False)
+        assert not slots.acquire(blocking=False)
+        slots.release()
+        slots.release()
+        acquired = []
+        for _ in range(17):
+            acquired.append(admissions.acquire(blocking=False))
+        assert acquired == [True] * 16 + [False]
+        for _ in range(16):
+            admissions.release()
 
     def test_hook_exception_still_isolated_under_timeout_path(self, monkeypatch):
         monkeypatch.setattr(
