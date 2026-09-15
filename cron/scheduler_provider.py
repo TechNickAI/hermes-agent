@@ -9,6 +9,7 @@ import contextlib
 import inspect
 import logging
 import threading
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,27 @@ def _backoff_wait_seconds(interval: float, consecutive_failures: int) -> float:
     if consecutive_failures <= 0:
         return interval
     return min(interval * (2 **(consecutive_failures - 1)), _EMFILE_BACKOFF_MAX_SECONDS)
+
+
+def _next_wait_seconds(
+    interval: float, tick_started_monotonic: float, now_monotonic: float
+) -> float:
+    """Remaining seconds of this tick's interval — fixed-RATE, not fixed-delay.
+
+    Sleeping a flat ``interval`` AFTER the tick returns makes the true period
+    ``interval + tick_work_seconds``, so the firing phase walks forward forever. In production
+    ~0.11s of dispatch work per tick measured a 60.114s period; a 5-minute job's lag climbed
+    ~0.6s per fire from 0.1s to 59.2s, then wrapped past a minute boundary and skipped the
+    slot outright. Anchoring the sleep to when the tick STARTED keeps cumulative drift at zero.
+
+    An overrunning tick yields immediately (never a negative sleep) and does not try to
+    "catch up" the missed cycles — the result is clamped to ``[0, interval]`` so a slow tick
+    cannot turn into a busy-loop storm.
+    """
+    remaining = interval - (now_monotonic - tick_started_monotonic)
+    if remaining <= 0.0:
+        return 0.0
+    return min(remaining, interval)
 
 
 def _note_tick_failure(exc: BaseException, consecutive_failures: int) -> int:
@@ -400,6 +422,9 @@ class InProcessCronScheduler(CronScheduler):
         # EMFILE backoff: don't hammer the store while fds are exhausted; a clean tick resets it.
         consecutive_failures = 0
         while not stop_event.is_set():
+            # Fixed-RATE anchor: taken BEFORE the tick so the sleep below subtracts this
+            # cycle's own work and the firing phase cannot drift.
+            _tick_started = time.monotonic()
             ok = False
             try:
                 if can_dispatch is not None and not can_dispatch():
@@ -435,7 +460,12 @@ class InProcessCronScheduler(CronScheduler):
             if ok:
                 clear_ticker_error()
                 consecutive_failures = 0
-            stop_event.wait(_backoff_wait_seconds(interval, consecutive_failures))
+            if consecutive_failures > 0:
+                # fd exhaustion: back off hard, phase is irrelevant while nothing can progress.
+                stop_event.wait(_backoff_wait_seconds(interval, consecutive_failures))
+            else:
+                stop_event.wait(
+                    _next_wait_seconds(interval, _tick_started, time.monotonic()))
 
     def _start_multiplex(
         self, stop_event, *, profile_homes, adapters=None, loop=None, interval=60,
@@ -489,6 +519,9 @@ class InProcessCronScheduler(CronScheduler):
 
         consecutive_failures = 0
         while not stop_event.is_set():
+            # Fixed-RATE anchor: taken BEFORE the tick so the sleep below subtracts this
+            # cycle's own work and the firing phase cannot drift.
+            _tick_started = time.monotonic()
             ok = False
             _tick_error = None
             _profile_errors: dict[str, str] = {}
@@ -544,7 +577,12 @@ class InProcessCronScheduler(CronScheduler):
                         record_ticker_error(_tick_error)
             if ok:
                 consecutive_failures = 0
-            stop_event.wait(_backoff_wait_seconds(interval, consecutive_failures))
+            if consecutive_failures > 0:
+                # fd exhaustion: back off hard, phase is irrelevant while nothing can progress.
+                stop_event.wait(_backoff_wait_seconds(interval, consecutive_failures))
+            else:
+                stop_event.wait(
+                    _next_wait_seconds(interval, _tick_started, time.monotonic()))
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
