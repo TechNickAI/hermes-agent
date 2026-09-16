@@ -33,7 +33,10 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   `cron.critical_lane_workers` (default 2) / `HERMES_CRON_CRITICAL_LANE_WORKERS`; an invalid value
   falls back to the default rather than disabling the lane. Both lanes share `_submit_with_guard`,
   so the dedupe guard, execution ledger and claim handling are identical. This isolates capacity,
-  not latency — a slow script still holds its own reserved slot.
+  not latency — a reserved slot is bounded only by `cron.script_timeout_seconds` (default 3600), so
+  prefer width >= 2 if several critical jobs must not queue behind each other. **`critical` is
+  currently set by hand-editing `jobs.json`** — there is no `cronjob` tool param or CLI flag yet
+  (adding one widens the always-sent tool schema; deliberate follow-up decision).
 
 ## Kanban (multi-agent work queue)
 

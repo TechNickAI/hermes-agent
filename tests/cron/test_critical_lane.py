@@ -575,6 +575,42 @@ class TestLaneWidthConfig:
         monkeypatch.setattr(sched, "load_config", boom)
         assert sched._resolve_critical_lane_workers() == sched._DEFAULT_CRITICAL_LANE_WORKERS
 
+    def test_invalid_config_value_is_logged_not_swallowed(self, monkeypatch, caplog):
+        """A mis-typed config value must surface, like the env path does.
+
+        Silent fallback hides operator error: the lane quietly runs at the
+        default width while config.yaml claims something else.
+        """
+        import logging
+
+        import cron.scheduler as sched
+
+        monkeypatch.delenv("HERMES_CRON_CRITICAL_LANE_WORKERS", raising=False)
+        monkeypatch.setattr(
+            sched, "load_config", lambda: {"cron": {"critical_lane_workers": "three"}})
+        with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+            assert sched._resolve_critical_lane_workers() == \
+                sched._DEFAULT_CRITICAL_LANE_WORKERS
+        assert any("critical_lane_workers" in r.getMessage() for r in caplog.records), \
+            "invalid config value was swallowed silently"
+
+    def test_unreadable_config_does_not_warn_but_still_defaults(self, monkeypatch, caplog):
+        """An unreadable config is an environment condition, not operator error."""
+        import logging
+
+        import cron.scheduler as sched
+
+        monkeypatch.delenv("HERMES_CRON_CRITICAL_LANE_WORKERS", raising=False)
+
+        def boom():
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr(sched, "load_config", boom)
+        with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+            assert sched._resolve_critical_lane_workers() == \
+                sched._DEFAULT_CRITICAL_LANE_WORKERS
+        assert not caplog.records, "an unreadable config should not warn every tick"
+
     def test_config_default_is_a_usable_lane_width(self):
         """The shipped config default must itself pass the >= 1 rule."""
         from hermes_cli.config_defaults import DEFAULT_CONFIG

@@ -1030,7 +1030,10 @@ def is_critical_job(job: dict) -> bool:
     agent job flagged ``critical: true`` is deliberately NOT admitted; it runs
     in the general pool as before. ``no_agent`` jobs also short-circuit before
     ``run_agent`` / SessionDB entirely (see ``_run_no_agent_job``). Scripts can
-    still run slowly: this isolates capacity, not a deadline guarantee.
+    still run slowly: this isolates capacity, not a deadline guarantee. A
+    reserved slot is bounded only by ``cron.script_timeout_seconds`` (default
+    3600), so a single slow script can hold its slot for up to an hour — run a
+    lane width >= 2 if several critical jobs must not queue behind each other.
 
     Returns False for anything malformed: reserved capacity is granted only on
     an unambiguous, fully-qualifying record.
@@ -1068,7 +1071,8 @@ def _resolve_critical_lane_workers() -> int:
                 "Invalid HERMES_CRON_CRITICAL_LANE_WORKERS=%r; using default %d",
                 raw, _DEFAULT_CRITICAL_LANE_WORKERS)
             return _DEFAULT_CRITICAL_LANE_WORKERS
-    with contextlib.suppress(Exception):
+    _cfg = None
+    try:
         _ucfg = load_config() or {}
         _cfg = (_ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}).get(
             "critical_lane_workers")
@@ -1079,6 +1083,16 @@ def _resolve_critical_lane_workers() -> int:
             logger.warning(
                 "cron.critical_lane_workers=%r must be >= 1; using default %d",
                 _cfg, _DEFAULT_CRITICAL_LANE_WORKERS)
+    except (ValueError, TypeError) as cfg_err:
+        # A mis-typed value is operator error worth surfacing; the env path
+        # already logs, so do not let the config path fail silently.
+        logger.warning(
+            "Invalid cron.critical_lane_workers=%r (%s); using default %d",
+            _cfg, cfg_err, _DEFAULT_CRITICAL_LANE_WORKERS)
+    except Exception:
+        # Config unreadable (missing file, bad YAML, profile race): the lane
+        # must still come up at its default rather than propagating into tick.
+        logger.debug("Could not read cron.critical_lane_workers", exc_info=True)
     return _DEFAULT_CRITICAL_LANE_WORKERS
 
 

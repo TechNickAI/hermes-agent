@@ -191,6 +191,49 @@ When `workdir` is set:
 Each agent run binds its `workdir` to that run's unique task identity. Workdir jobs therefore use the normal parallel pool without mutating process-global terminal state or leaking paths between concurrent runs. Set `cron.max_parallel_jobs` if you want to limit total cron concurrency.
 :::
 
+## Reserved lane for critical script jobs
+
+Cron runs due jobs in a shared pool with no priority ordering. A burst of long-running agent jobs
+can therefore hold every worker while a short script job waits behind them — for as long as those
+agent jobs take.
+
+A job can opt into a small **reserved pool** that ordinary jobs can never occupy. To qualify, its
+record needs **both**:
+
+- `critical: true`, and
+- it must be a script job — `no_agent: true` with a non-empty `script`.
+
+```json
+{
+  "id": "a1b2c3d4e5f6",
+  "name": "Disk space watchdog",
+  "script": "check_disk.sh",
+  "no_agent": true,
+  "critical": true
+}
+```
+
+Agent jobs are **deliberately excluded**, even when flagged. A model turn has no bounded duration,
+and parking one in a reserved slot recreates the exact starvation the lane exists to prevent — only
+now inside the protected lane. A flagged agent job simply runs in the general pool as before.
+
+Lane width is `cron.critical_lane_workers` (default `2`), or the `HERMES_CRON_CRITICAL_LANE_WORKERS`
+environment variable. An unset, invalid, or less-than-one value falls back to the default rather
+than disabling the lane, so a typo in `config.yaml` cannot silently drop critical jobs back into the
+pool they are being protected from.
+
+:::caution This reserves capacity, not latency
+A reserved slot is bounded only by `cron.script_timeout_seconds` (default `3600`), so one slow
+script can hold its slot for up to an hour. The lane guarantees a critical script job is never
+queued behind *agent* work — not that it finishes by any deadline. If several critical jobs must
+not queue behind each other, raise the width.
+:::
+
+:::note Setting the flag
+`critical` currently has no CLI flag or `cronjob` tool parameter — set it by editing the job's
+record in `jobs.json` directly. Everything else (`hermes cron edit`, pause/resume) preserves it.
+:::
+
 ## Editing jobs
 
 You do not need to delete and recreate jobs just to change them.
