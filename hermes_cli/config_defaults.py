@@ -1677,6 +1677,12 @@ DEFAULT_CONFIG = {
         # Max due jobs run in parallel per tick. None/0 = unbounded (thread count only); 1 = serial.
         # Env override: HERMES_CRON_MAX_PARALLEL.
         "max_parallel_jobs": None,
+        # Width of the RESERVED "critical lane" pool. Jobs flagged ``critical: true`` on their
+        # jobs.json record dispatch into this pool instead of the general one, so a saturated
+        # general pool (long-running LLM agent jobs) can never delay them. Must be >= 1; an
+        # unset/invalid value falls back to cron.scheduler._DEFAULT_CRITICAL_LANE_WORKERS (2).
+        # Env override: HERMES_CRON_CRITICAL_LANE_WORKERS.
+        "critical_lane_workers": 2,
         # save_job_output keeps the N most recent .md files per job; 0 or negative disables pruning
         # (for externally managed cleanup).
         "output_retention": 50,
