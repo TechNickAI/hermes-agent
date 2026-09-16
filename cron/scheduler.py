@@ -508,6 +508,21 @@ def _is_cron_silence_response(text: str) -> bool:
 # Persistent pool for parallel cron jobs: tick() submits and returns; long jobs never block it.
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
+
+# Reserved "critical lane" pool.  The general pool above is FIFO with no
+# priority, so a burst of long-running LLM agent jobs (measured on the real
+# fleet: p90 60min, p99 92min, max 189min for one job) can hold every slot
+# while a short money-path script job waits.  Jobs flagged ``critical: true``
+# on their jobs.json record dispatch here instead; nothing else may ever
+# occupy a slot in this pool, so the reserved capacity cannot be consumed by
+# the very jobs it exists to protect against.
+_critical_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_critical_pool_max_workers: Optional[int] = None
+
+# Default reserved-lane width. Sized for a small tier-1 set of short script
+# jobs; operators widen it via ``cron.critical_lane_workers`` in config.yaml
+# or the HERMES_CRON_CRITICAL_LANE_WORKERS env var.
+_DEFAULT_CRITICAL_LANE_WORKERS = 2
 _running_job_ids: set = set()
 _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
 # Parent gateway threads synchronously waiting on restart-safe scope workers.
@@ -977,13 +992,96 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
     return _parallel_pool
 
 
+def is_critical_job(job) -> bool:
+    """True when this job record opts into the reserved critical lane.
+
+    The selector is a field on the Hermes job record (``critical: true`` in
+    jobs.json) — never a hardcoded job id or name here — so operators control
+    membership by editing the job, and every job without the field keeps the
+    existing general-pool behaviour unchanged.
+
+    Accepts the JSON boolean plus the string/int spellings a hand-edited
+    jobs.json or a CLI round-trip can produce. Anything else (including
+    ``None`` and structured junk) is False: an unparseable value must never
+    silently grant reserved capacity.
+    """
+    if not isinstance(job, dict):
+        return False
+    value = job.get("critical")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1", "on")
+    return False
+
+
+def _resolve_critical_lane_workers() -> int:
+    """Reserved-lane width: env > config.yaml > default. Always >= 1.
+
+    An unset, non-numeric, zero or negative value falls back to the default
+    rather than disabling the lane: a mis-typed config must not silently drop
+    critical jobs back into the pool they are being protected from.
+    """
+    raw = os.getenv("HERMES_CRON_CRITICAL_LANE_WORKERS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed >= 1:
+                return parsed
+            logger.warning(
+                "HERMES_CRON_CRITICAL_LANE_WORKERS=%r must be >= 1; using default %d",
+                raw, _DEFAULT_CRITICAL_LANE_WORKERS)
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid HERMES_CRON_CRITICAL_LANE_WORKERS=%r; using default %d",
+                raw, _DEFAULT_CRITICAL_LANE_WORKERS)
+        return _DEFAULT_CRITICAL_LANE_WORKERS
+    with contextlib.suppress(Exception):
+        _ucfg = load_config() or {}
+        _cfg = (_ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}).get(
+            "critical_lane_workers")
+        if _cfg is not None:
+            parsed = int(_cfg)
+            if parsed >= 1:
+                return parsed
+            logger.warning(
+                "cron.critical_lane_workers=%r must be >= 1; using default %d",
+                _cfg, _DEFAULT_CRITICAL_LANE_WORKERS)
+    return _DEFAULT_CRITICAL_LANE_WORKERS
+
+
+def _get_critical_pool(max_workers: int) -> concurrent.futures.ThreadPoolExecutor:
+    """Return (or create) the reserved critical-lane pool.
+
+    Mirrors ``_get_parallel_pool``'s replace-on-resize behaviour so a config
+    change does not leak the old executor: the outgoing pool is shut down
+    (``wait=False`` so in-flight critical jobs finish on their own threads)
+    and replaced.
+    """
+    global _critical_pool, _critical_pool_max_workers
+    if _critical_pool is None or _critical_pool_max_workers != max_workers:
+        if _critical_pool is not None:
+            _critical_pool.shutdown(wait=False, cancel_futures=False)
+        _critical_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="cron-critical")
+        _critical_pool_max_workers = max_workers
+    return _critical_pool
+
+
 def _shutdown_parallel_pool() -> None:
-    """Shut down the persistent pool on process exit."""
+    """Shut down the persistent pools on process exit."""
     global _parallel_pool, _parallel_pool_max_workers
+    global _critical_pool, _critical_pool_max_workers
     if _parallel_pool is not None:
         _parallel_pool.shutdown(wait=True, cancel_futures=False)
         _parallel_pool = None
         _parallel_pool_max_workers = None
+    if _critical_pool is not None:
+        _critical_pool.shutdown(wait=True, cancel_futures=False)
+        _critical_pool = None
+        _critical_pool_max_workers = None
 
 
 atexit.register(_shutdown_parallel_pool)
@@ -3817,13 +3915,41 @@ def tick(
         def _process_job(job: dict) -> bool:
             return _process_due_job(job, adapters, loop, verbose)
 
-        # Persistent pool, non-blocking dispatch. Already-running jobs are skipped; mark_job_run
+        # Persistent pools, non-blocking dispatch. Already-running jobs are skipped; mark_job_run
         # re-arms next_run_at on completion, so no catch-up queue is needed.
+        #
+        # TWO LANES. Jobs flagged ``critical: true`` dispatch to a small RESERVED pool;
+        # every other job goes to the general pool exactly as before. The lanes never share
+        # slots, so a saturated general pool (long-running LLM agent jobs) cannot delay a
+        # critical job's dispatch, and a non-critical job can never occupy a reserved slot.
+        # Both lanes go through the same _submit_with_guard, so the in-flight dedupe guard,
+        # the execution ledger and claim handling are identical on both; both lanes' futures
+        # land in the single _all_futures list that drives sync collection and the async
+        # MCP-orphan sweep. Pools are created lazily so a tick with no critical jobs (the
+        # overwhelming majority) pays nothing for the lane.
+        #
+        # SCOPE OF THE GUARANTEE (verified by tests/cron/test_critical_lane.py): the lane
+        # guarantees a critical job is never blocked on GENERAL-POOL CAPACITY. It does not
+        # override the in-flight dedupe guard: a job already registered as running — e.g.
+        # one still queued in the general pool from an earlier tick, whose ``critical`` flag
+        # was flipped in between — is still skipped until it is released or the stale-inflight
+        # sweep reclaims it. That behaviour is pre-existing and identical without this change;
+        # it is a transient of a live flag change, not a starvation path for a steady-state
+        # critical job.
         _results: list = []
         _all_futures: list = []
-        pool = _get_parallel_pool(_max_workers)
+        pool = None
+        critical_pool = None
         for job in due_jobs:
-            fut = _submit_with_guard(job, pool, _process_job)
+            if is_critical_job(job):
+                if critical_pool is None:
+                    critical_pool = _get_critical_pool(_resolve_critical_lane_workers())
+                target_pool = critical_pool
+            else:
+                if pool is None:
+                    pool = _get_parallel_pool(_max_workers)
+                target_pool = pool
+            fut = _submit_with_guard(job, target_pool, _process_job)
             if fut is None:
                 continue
             _all_futures.append(fut)
