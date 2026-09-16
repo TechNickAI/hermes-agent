@@ -508,6 +508,21 @@ def _is_cron_silence_response(text: str) -> bool:
 # Persistent pool for parallel cron jobs: tick() submits and returns; long jobs never block it.
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
+
+# Reserved "critical lane" pool.  The general pool above is FIFO with no
+# priority, so a burst of long-running LLM agent jobs can hold every slot and
+# leave a short, latency-sensitive script job queued behind them for as long
+# as those jobs run.  A qualifying job (``critical: true`` AND a no_agent
+# script job — see ``is_critical_job``) dispatches here instead; nothing else
+# may ever occupy a slot in this pool, so the reserved capacity cannot be
+# consumed by the very jobs it exists to protect against.
+_critical_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_critical_pool_max_workers: Optional[int] = None
+
+# Default reserved-lane width.  Sized for a small set of short script jobs;
+# operators widen it via
+# ``cron.critical_lane_workers`` in config.yaml or HERMES_CRON_CRITICAL_LANE_WORKERS.
+_DEFAULT_CRITICAL_LANE_WORKERS = 2
 _running_job_ids: set = set()
 _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
 # Parent gateway threads synchronously waiting on restart-safe scope workers.
@@ -977,13 +992,140 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
     return _parallel_pool
 
 
+def _critical_flag_is_set(job: dict) -> bool:
+    """Parse the ``critical`` field's truthiness, tolerating hand-edited spellings.
+
+    Accepts the JSON boolean plus the string/int spellings a hand-edited
+    jobs.json or a CLI round-trip can produce.  Anything else is False:
+    an unparseable value must not silently grant reserved capacity.
+    """
+    value = job.get("critical")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1", "on")
+    return False
+
+
+def is_critical_job(job: dict) -> bool:
+    """True when this job qualifies for the reserved critical lane.
+
+    Two conditions, BOTH required:
+
+    1. ``critical: true`` on the Hermes job record (jobs.json).  The selector is
+       a field on the record — never a hardcoded job id or name here — so
+       operators control membership by editing the job, and every job without
+       the field keeps the existing general-pool behaviour unchanged.
+    2. The job is a **script job**: ``no_agent`` is true AND ``script`` is a
+       non-empty string.
+
+    Condition 2 is the point of the lane, not a convenience check. The lane
+    exists to keep short, deterministic script jobs from queueing behind
+    long-running LLM agent jobs. An agent job admitted to the reserved lane
+    would be exactly the kind of unbounded-duration work the reservation is
+    protecting against — it could hold a reserved slot for the whole length of
+    a model turn and starve the script jobs the lane was created for. So an
+    agent job flagged ``critical: true`` is deliberately NOT admitted; it runs
+    in the general pool as before. ``no_agent`` jobs also short-circuit before
+    ``run_agent`` / SessionDB entirely (see ``_run_no_agent_job``). Scripts can
+    still run slowly: this isolates capacity, not a deadline guarantee. A
+    reserved slot is bounded only by ``cron.script_timeout_seconds`` (default
+    3600), so a single slow script can hold its slot for up to an hour — run a
+    lane width >= 2 if several critical jobs must not queue behind each other.
+
+    Returns False for anything malformed: reserved capacity is granted only on
+    an unambiguous, fully-qualifying record.
+    """
+    if not isinstance(job, dict):
+        return False
+    if not _critical_flag_is_set(job):
+        return False
+    # Agent jobs are excluded by design (see docstring) — the lane is for scripts.
+    if not job.get("no_agent"):
+        return False
+    script = job.get("script")
+    return isinstance(script, str) and bool(script.strip())
+
+
+def _resolve_critical_lane_workers() -> int:
+    """Reserved-lane width: env > config.yaml > default. Always >= 1.
+
+    An unset, non-numeric, zero or negative value falls back to the default
+    rather than disabling the lane: a mis-typed config must not silently drop
+    critical jobs back into the pool they are being protected from.
+    """
+    raw = os.getenv("HERMES_CRON_CRITICAL_LANE_WORKERS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed >= 1:
+                return parsed
+            logger.warning(
+                "HERMES_CRON_CRITICAL_LANE_WORKERS=%r must be >= 1; using default %d",
+                raw, _DEFAULT_CRITICAL_LANE_WORKERS)
+            return _DEFAULT_CRITICAL_LANE_WORKERS
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid HERMES_CRON_CRITICAL_LANE_WORKERS=%r; using default %d",
+                raw, _DEFAULT_CRITICAL_LANE_WORKERS)
+            return _DEFAULT_CRITICAL_LANE_WORKERS
+    _cfg = None
+    try:
+        _ucfg = load_config() or {}
+        _cfg = (_ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}).get(
+            "critical_lane_workers")
+        if _cfg is not None:
+            parsed = int(_cfg)
+            if parsed >= 1:
+                return parsed
+            logger.warning(
+                "cron.critical_lane_workers=%r must be >= 1; using default %d",
+                _cfg, _DEFAULT_CRITICAL_LANE_WORKERS)
+    except (ValueError, TypeError) as cfg_err:
+        # A mis-typed value is operator error worth surfacing; the env path
+        # already logs, so do not let the config path fail silently.
+        logger.warning(
+            "Invalid cron.critical_lane_workers=%r (%s); using default %d",
+            _cfg, cfg_err, _DEFAULT_CRITICAL_LANE_WORKERS)
+    except Exception:
+        # Config unreadable (missing file, bad YAML, profile race): the lane
+        # must still come up at its default rather than propagating into tick.
+        logger.debug("Could not read cron.critical_lane_workers", exc_info=True)
+    return _DEFAULT_CRITICAL_LANE_WORKERS
+
+
+def _get_critical_pool(max_workers: int) -> concurrent.futures.ThreadPoolExecutor:
+    """Return (or create) the reserved critical-lane pool.
+
+    Mirrors ``_get_parallel_pool``'s replace-on-resize behaviour so a config
+    change does not leak the old executor: the outgoing pool is shut down
+    (wait=False so in-flight critical jobs finish on their own threads) and
+    replaced.
+    """
+    global _critical_pool, _critical_pool_max_workers
+    if _critical_pool is None or _critical_pool_max_workers != max_workers:
+        if _critical_pool is not None:
+            _critical_pool.shutdown(wait=False, cancel_futures=False)
+        _critical_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="cron-critical")
+        _critical_pool_max_workers = max_workers
+    return _critical_pool
+
+
 def _shutdown_parallel_pool() -> None:
-    """Shut down the persistent pool on process exit."""
+    """Shut down the persistent pools on process exit."""
     global _parallel_pool, _parallel_pool_max_workers
+    global _critical_pool, _critical_pool_max_workers
     if _parallel_pool is not None:
         _parallel_pool.shutdown(wait=True, cancel_futures=False)
         _parallel_pool = None
         _parallel_pool_max_workers = None
+    if _critical_pool is not None:
+        _critical_pool.shutdown(wait=True, cancel_futures=False)
+        _critical_pool = None
+        _critical_pool_max_workers = None
 
 
 atexit.register(_shutdown_parallel_pool)
@@ -3817,13 +3959,32 @@ def tick(
         def _process_job(job: dict) -> bool:
             return _process_due_job(job, adapters, loop, verbose)
 
-        # Persistent pool, non-blocking dispatch. Already-running jobs are skipped; mark_job_run
+        # Persistent pools, non-blocking dispatch. Already-running jobs are skipped; mark_job_run
         # re-arms next_run_at on completion, so no catch-up queue is needed.
+        #
+        # Two lanes. A job that qualifies for the reserved lane (``critical: true``
+        # AND a no_agent script job — see is_critical_job) goes to a small RESERVED
+        # pool; everything else, including any agent job, goes to the general pool
+        # exactly as before. The lanes never share slots, so a saturated general pool
+        # (long LLM agent jobs) cannot delay a critical script job's dispatch, and a
+        # non-qualifying job can never occupy a reserved slot. Both lanes go through
+        # the same _submit_with_guard, so the in-flight dedupe guard, execution ledger
+        # and claim handling are identical, and both lanes' futures land in the one
+        # _all_futures list that drives sync collection and the async MCP-orphan sweep.
         _results: list = []
         _all_futures: list = []
-        pool = _get_parallel_pool(_max_workers)
+        pool = None
+        critical_pool = None
         for job in due_jobs:
-            fut = _submit_with_guard(job, pool, _process_job)
+            if is_critical_job(job):
+                if critical_pool is None:
+                    critical_pool = _get_critical_pool(_resolve_critical_lane_workers())
+                target_pool = critical_pool
+            else:
+                if pool is None:
+                    pool = _get_parallel_pool(_max_workers)
+                target_pool = pool
+            fut = _submit_with_guard(job, target_pool, _process_job)
             if fut is None:
                 continue
             _all_futures.append(fut)
