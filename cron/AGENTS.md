@@ -12,7 +12,7 @@ schedule via the `cronjob` tool; users via `hermes cron list|add|edit|pause|resu
 `skills`, `model`/`provider` overrides, `script` (pre-run data-collection script whose stdout is
 injected into the prompt; `no_agent=True` makes the script the whole job), `context_from` (chain job
 A's last output into job B's prompt), `workdir` (run with that directory's `AGENTS.md`/`CLAUDE.md`
-loaded), multi-platform delivery.
+loaded), `critical` (reserved-lane opt-in; see below), multi-platform delivery.
 
 Hardening invariants — each guards a real failure; don't weaken without answering for it:
 - **3-minute hard interrupt** on cron sessions: runaway loops cannot monopolise the scheduler.
@@ -25,6 +25,15 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   "spawned by the app", not "a GUI is watching" (root: capability is a property of the session).
 - Background `delegate_task` is process-local; work that must survive restarts is a cron job or a
   `terminal(background=True, notify_on_complete=True)` process.
+- **Reserved critical lane.** `tick` dispatches into TWO pools that never share slots. A job
+  qualifies for the small reserved pool only when its record has BOTH `critical: true` AND is a
+  script job (`no_agent: true` with a non-empty `script`); everything else — including a flagged
+  AGENT job — uses the general pool exactly as before. Agent jobs are excluded on purpose: an
+  unbounded model turn in a reserved slot is the very starvation the lane prevents. Width:
+  `cron.critical_lane_workers` (default 2) / `HERMES_CRON_CRITICAL_LANE_WORKERS`; an invalid value
+  falls back to the default rather than disabling the lane. Both lanes share `_submit_with_guard`,
+  so the dedupe guard, execution ledger and claim handling are identical. This isolates capacity,
+  not latency — a slow script still holds its own reserved slot.
 
 ## Kanban (multi-agent work queue)
 
