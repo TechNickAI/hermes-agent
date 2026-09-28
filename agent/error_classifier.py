@@ -407,8 +407,11 @@ _V_REASONING_MANDATORY = _v(_R.reasoning_mandatory, should_compress=False, shoul
 # other provider can fix that output, so falling back only replays the same broken turn 4-5 times
 # (20-60s per occurrence, #12770). Abort this call; the loop's argument repair handles the retry.
 _V_MALFORMED_TOOL_ARGS = _v(_R.format_error, retryable=False, should_fallback=False)
-# A reasoning-mandatory route answering ``reasoning: {enabled: false}`` (Nous Portal + OpenRouter wording).
-_REASONING_MANDATORY_PATTERN = "reasoning is mandatory"
+# A reasoning-mandatory route answering a thinking/reasoning disable. Nous Portal + OpenRouter say
+# "reasoning is mandatory"; Anthropic (Opus 5.5 / Sonnet 5.5, direct or via a proxy) says
+# '"thinking.type.disabled" is not supported for this model'. Both mean the same recovery: stop
+# sending the disable and retry once. Matched on the lowercased message.
+_REASONING_MANDATORY_PATTERNS = ("reasoning is mandatory", '"thinking.type.disabled" is not supported')
 
 
 def _billing_hints(error_msg: str) -> Verdict:
@@ -794,10 +797,10 @@ def _classify_400(c: _Ctx) -> Verdict:
         "conflicting authenticated continuation identities" in msg
     ):
         return _V_INVALID_ENCRYPTED
-    # Reasoning-mandatory route rejecting a disable (GLM-5.3 on Nous Portal / OpenRouter). Deterministic
+    # Reasoning-mandatory route rejecting a disable (GLM-5.3 on Nous Portal / OpenRouter, Claude 5.5). Deterministic
     # for the request shape, but the only bad field is ``reasoning: {enabled: false}`` — the loop drops
     # the disable and retries once. Must precede request-validation, which would abort as format_error.
-    if _REASONING_MANDATORY_PATTERN in msg:
+    if any(p in msg for p in _REASONING_MANDATORY_PATTERNS):
         return _V_REASONING_MANDATORY
     # 400 blaming a field this route never sent (Codex OAuth injects then rejects
     # prompt_cache_retention ~20% of the time): transient, retry identical request.
