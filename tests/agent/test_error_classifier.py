@@ -874,6 +874,27 @@ class TestClassifyApiError:
         assert result.should_fallback is False
         assert result.should_compress is False
 
+    @pytest.mark.parametrize("message", [
+        # Anthropic direct (Sonnet 5.5 wording)
+        '"thinking.type.disabled" is not supported for this model. Use "thinking.type.between_tools" '
+        'for the lowest thinking setting, or "thinking.type.adaptive" and "output_config.effort" to '
+        'control thinking.',
+        # The same rejection relayed by an OpenAI-compatible proxy (OmniRoute) for Opus 5.5
+        '[400]: "thinking.type.disabled" is not supported for this model. Use "thinking.type.adaptive" '
+        'and "output_config.effort" to control thinking',
+    ])
+    def test_anthropic_thinking_disabled_rejection_is_reasoning_mandatory(self, message):
+        """Claude 5.5 rejects a thinking disable in Anthropic's own words. It must take the same
+        drop-the-disable-and-retry recovery as "reasoning is mandatory", not abort as format_error:
+        a combo alias (claude-spare-capacity) never matches the static mandatory-thinking list, so
+        this classification is the only thing that saves the one-shot reasoning-off continuation."""
+        e = MockAPIError(message, status_code=400, body={"type": "error", "error": {
+            "type": "invalid_request_error", "message": message}})
+        result = classify_api_error(e, provider="custom", model="claude-spare-capacity")
+        assert result.reason == FailoverReason.reasoning_mandatory
+        assert result.retryable is True
+        assert result.should_fallback is False
+
     # ── Provider-specific: llama.cpp grammar-parse ──
 
     def test_llama_cpp_unable_to_generate_parser_template(self):

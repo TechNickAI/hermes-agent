@@ -1896,3 +1896,13 @@ class TestFinalPayloadHasNoBlankTextBlocks:
         )
         image_blocks = [b for b in tool_result_block["content"] if b.get("type") == "image"]
         assert len(image_blocks) == 1
+
+
+def test_claude_5_5_thinking_disable_is_omitted_not_sent():
+    """Opus/Sonnet 5.5 400 on thinking.type=disabled, so reasoning-off must omit the parameter
+    for the real model ids, while Sonnet 5 (which accepts the disable) keeps sending it."""
+    from agent.anthropic_adapter import _thinking_kwargs
+    off = {"enabled": False}
+    for model in ("claude-opus-5-5", "claude-sonnet-5-5", "anthropic/claude-sonnet-5.5"):
+        assert _thinking_kwargs(off, model, 8000) == {}, model
+    assert _thinking_kwargs(off, "claude-sonnet-5", 8000) == {"thinking": {"type": "disabled"}}
