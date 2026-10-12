@@ -487,7 +487,11 @@ _V_ROLE_ALTERNATION = _v(_R.role_alternation, **_ABORT_FALLBACK)
 # (20-60s per occurrence, #12770). Abort this call; the loop's argument repair handles the retry.
 _V_MALFORMED_TOOL_ARGS = _v(_R.format_error, retryable=False, should_fallback=False)
 # A reasoning-mandatory route answering ``reasoning: {enabled: false}`` (Nous Portal + OpenRouter wording).
-_REASONING_MANDATORY_PATTERN = "reasoning is mandatory"
+# A reasoning-mandatory route answering a thinking/reasoning disable. Nous Portal + OpenRouter say
+# "reasoning is mandatory"; Anthropic (Opus 5.5 / Sonnet 5.5, direct or via a proxy) says
+# '"thinking.type.disabled" is not supported for this model'. Both mean the same recovery: stop
+# sending the disable and retry once. Matched on the lowercased message.
+_REASONING_MANDATORY_PATTERNS = ("reasoning is mandatory", '"thinking.type.disabled" is not supported')
 
 # Generic markers a provider 400 puts next to the offending parameter name. Bedrock Converse
 # rejects sampling params for reasoning-first models with the contraction ("This model doesn't
@@ -914,6 +918,11 @@ def _by_message(c: _Ctx) -> Optional[Verdict]:
     head = _first_match(c.msg, _MESSAGE_HEAD_RULES)
     if head is not None:
         return head
+    # A proxy (OmniRoute) relays the upstream 400 as an SSE ``event: error`` frame behind HTTP 200, so
+    # _classify_400 never sees it and the turn burns every retry as ``unknown`` resending the same
+    # disable. Exact wording only: the generic field-rejection heuristic stays scoped to real 400s.
+    if any(p in c.msg for p in _REASONING_MANDATORY_PATTERNS):
+        return _V_REASONING_MANDATORY
     usage_limit = any(p in c.msg for p in _USAGE_LIMIT_PATTERNS)
     return _classify_402(c.msg, dict) if usage_limit else _first_match(c.msg, _MESSAGE_TAIL_RULES)
 
@@ -1172,7 +1181,7 @@ def _classify_400(c: _Ctx) -> Verdict:
     # OpenRouter) or a chat-only relay that does not accept ``reasoning_effort: none`` at all
     # (#114460). Deterministic for the request shape, but the only bad field is the disable — the
     # loop drops it and retries once. Must precede request-validation, which would abort as format_error.
-    if _REASONING_MANDATORY_PATTERN in msg or is_reasoning_field_rejection(msg):
+    if any(p in msg for p in _REASONING_MANDATORY_PATTERNS) or is_reasoning_field_rejection(msg):
         return _V_REASONING_MANDATORY
     # 400 blaming a field this route never sent (Codex OAuth injects then rejects
     # prompt_cache_retention ~20% of the time): transient, retry identical request.
