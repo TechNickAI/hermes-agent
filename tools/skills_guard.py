@@ -753,6 +753,15 @@ _PROSE_IS_THE_PAYLOAD = {"injection", "obfuscation", "persistence"}
 # let an attacker downgrade a critical finding by simply not using a code block.
 _DEMOTED_SEVERITY = {"high": "medium", "medium": "low", "low": "low"}
 
+# Pattern ids whose prose severity upstream already decides, so the generic prose demotion
+# defers to it rather than stacking a second step on top:
+#   inline_shell_exec -- `!`cmd`` is skill DSL the runtime EXPANDS (skills.inline_shell), not a
+#     description of a command; upstream keeps it high for community installs on purpose
+#     (5d5e763780). Demoting it here let such a bundle install without --force.
+#   _PATH_REFERENCE_PATTERN_IDS -- credential-directory mentions (~/.ssh, ~/.aws, ...) are judged
+#     by upstream's _demote_inert_path_reference; a mention it leaves at full severity must stay.
+_NEVER_PROSE_DEMOTED = frozenset({"inline_shell_exec"})
+
 
 def _markdown_code_line_numbers(lines: list) -> set:
     """1-based line numbers inside fenced code blocks of a markdown document.
@@ -815,7 +824,8 @@ def scan_file(file_path: Path, rel_path: str = "") -> list[Finding]:
                 line_severity, line_description = _demote_inert_path_reference(
                     pid, severity, description, line, lines[owners[i - 1]], suffix)
                 if (line_severity == severity and code_lines is not None and i not in code_lines
-                        and category not in _PROSE_IS_THE_PAYLOAD):
+                        and category not in _PROSE_IS_THE_PAYLOAD and pid not in _NEVER_PROSE_DEMOTED
+                        and pid not in _PATH_REFERENCE_PATTERN_IDS):
                     line_severity = _DEMOTED_SEVERITY.get(severity, severity)
                     line_description = f"{description} (in prose, not a code block)"
                 findings.append(Finding(pid, line_severity, category, rel_path, i,
