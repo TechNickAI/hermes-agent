@@ -38,13 +38,15 @@ jobs:
     # 3x the price because files contend for the shared machine. Separate machines
     # scale linearly. run_tests_parallel.py partitions from the checkout alone, so
     # both slices agree on the split without a planning job.
-    name: Run tests (${{ matrix.slice }}/2)
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    name: Run tests (${{ matrix.slice }}/4)
+    # Fork (personal account): no larger runners, so ``*-32-core`` jobs queue until cancelled.
+    # Four standard 4-vCPU slices instead of two 32-core ones.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        slice: [1, 2]
+        slice: [1, 2, 3, 4]
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -106,8 +108,8 @@ jobs:
         run: |
           scripts/run_tests.sh
         env:
-          HERMES_TEST_SLICE: ${{ matrix.slice }}/2
-          HERMES_TEST_WORKERS: 32
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/4
+          HERMES_TEST_WORKERS: 4
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""

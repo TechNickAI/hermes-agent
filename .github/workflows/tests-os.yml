@@ -89,10 +89,11 @@ jobs:
             marker: macos
             slice: 2/2
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            runner: windows-latest
+            timeout: 60
             marker: windows
           - name: Windows-only tests (arm64)
-            runner: windows-latest-32-arm-core
+            runner: windows-11-arm
             marker: windows
             timeout: 60
     steps:
@@ -187,7 +188,7 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '4' || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
