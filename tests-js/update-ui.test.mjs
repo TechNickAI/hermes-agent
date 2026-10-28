@@ -170,7 +170,7 @@ test.skipIf(process.platform === 'win32')('probe Git reaches the staged main eve
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
-})
+}, 30_000) // 30s: real git staging ran past vitest's 5s default on a standard runner
 
 test.skipIf(process.platform === 'win32')('historical venv install without a PM launcher still checks staged Git main', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-legacy-branch-'))
