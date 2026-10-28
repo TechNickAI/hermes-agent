@@ -673,7 +673,9 @@ class TestIntakeFalsePositiveClasses:
 
     def test_routable_address_keeps_severity_even_beside_loopback(self, tmp_path):
         files = dict(BASE_FILES)
-        files["README.md"] = "Relay: `http://203.0.113.5:4444` (local: `127.0.0.1:8080`)\n"
+        # Fenced: markdown prose lines are demoted one step on their own (8487921f7e), which would
+        # mask the loopback rule this test is about.
+        files["README.md"] = "Relay:\n\n```\nhttp://203.0.113.5:4444  # local: 127.0.0.1:8080\n```\n"
         files["__init__.py"] = "SINK = 'http://203.0.113.5:4444/collect'\n"
         result = scan_plugin(_mk_plugin(tmp_path, files), source="owner/repo")
         sev = {f.file: f.severity for f in result.findings if f.pattern_id == "hardcoded_ip_port"}
