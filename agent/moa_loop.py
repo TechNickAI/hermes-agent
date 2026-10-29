@@ -152,6 +152,33 @@ _RUNTIME_CACHE_TTL_SECONDS = 300.0
 # Cap on concurrent reference calls (guards pathologically large presets).
 _MAX_REFERENCE_WORKERS = 8
 
+# Abandoned (deadline/interrupt) reference calls still running, per advisor label, process-wide.
+# A running call cannot be killed, and every fan-out builds a fresh executor, so without this a
+# stuck advisor would be re-dispatched every turn and pile up billing threads. While one is still
+# running, that advisor is not dispatched again; it frees when the abandoned call finishes.
+_abandoned_lock = threading.Lock()
+_abandoned_inflight: dict[str, int] = {}
+
+
+def _abandoned_still_running(label: str) -> bool:
+    with _abandoned_lock:
+        return _abandoned_inflight.get(label, 0) > 0
+
+
+def _track_abandoned(label: str, future: Any) -> None:
+    with _abandoned_lock:
+        _abandoned_inflight[label] = _abandoned_inflight.get(label, 0) + 1
+
+    def _release(_future: Any) -> None:
+        with _abandoned_lock:
+            left = _abandoned_inflight.get(label, 1) - 1
+            if left > 0:
+                _abandoned_inflight[label] = left
+            else:
+                _abandoned_inflight.pop(label, None)
+
+    future.add_done_callback(_release)
+
 
 @dataclass(slots=True)
 class _RefAccounting:
@@ -300,7 +327,7 @@ def _with_cache_disabled(runtime: dict[str, Any], cache_disabled: Any) -> dict[s
     return runtime if cache_disabled is None else {**runtime, "_cache_disabled": cache_disabled}
 
 
-def _reference_liveness_hook(agent: Any, label: str) -> Any:
+def _reference_liveness_hook(agent: Any, label: str, fence: Any = None) -> Any:
     """Thread-local aux progress hook bridging advisor stream chunks to the agent's
     activity clock.
 
@@ -316,6 +343,10 @@ def _reference_liveness_hook(agent: Any, label: str) -> Any:
     touch = getattr(agent, "_touch_activity", None)
 
     def _touch_on_progress() -> None:
+        # *fence* is set once the fan-out abandons this call (deadline or interrupt): its
+        # late chunks must not re-arm the watchdog for the aggregator or a later turn.
+        if fence is not None and fence.is_set():
+            return
         if callable(touch):
             touch(f"MoA reference {label}: stream progress")
 
@@ -399,6 +430,7 @@ def _run_reference(
     slot: dict[str, Any], ref_messages: list[dict[str, Any]], *, temperature: float | None = None,
     max_tokens: int | None = None, reference_timeout: float | None = None, context_length_cache: Any = None,
     cache_disabled: bool | None = None, cache_ttl: str | None = None, agent: Any = None,
+    abandon_fence: Any = None,
 ) -> tuple[str, str, Any]:
     """Call one reference model; return ``(label, text, accounting)``. Never raises:
     a failed reference becomes a labelled ``[failed: …]`` note. Runs in a thread pool."""
@@ -427,7 +459,7 @@ def _run_reference(
         if agent is not None:
             from agent.auxiliary_client import aux_progress_hook
 
-            with aux_progress_hook(_reference_liveness_hook(agent, label)):
+            with aux_progress_hook(_reference_liveness_hook(agent, label, abandon_fence)):
                 response = call_llm(
                     task="moa_reference", messages=trimmed, temperature=temperature,
                     max_tokens=max_tokens,
@@ -590,8 +622,10 @@ def _settle_interrupted(
             results[idx] = future.result()
             continue
         results[idx] = _placeholder_output(reference_models[idx], note)
-        if not cancelled and late_accounting_sink is not None:
-            future.add_done_callback(functools.partial(_record_late, late_accounting_sink, results[idx][0]))
+        if not cancelled:
+            _track_abandoned(results[idx][0], future)
+            if late_accounting_sink is not None:
+                future.add_done_callback(functools.partial(_record_late, late_accounting_sink, results[idx][0]))
 
 
 def _record_late(sink: Any, label: str, future: Any) -> None:
@@ -627,6 +661,7 @@ def _run_references_parallel(
     executor = ThreadPoolExecutor(max_workers=min(_MAX_REFERENCE_WORKERS, total))
     interrupted = False
     timed_out = False
+    abandon_fence = threading.Event()
     # Shared per-fan-out context-length cache (dict get/set is GIL-atomic).
     ctx_len_cache: dict[tuple[str, str], int | None] = {}
     cache_disabled, cache_ttl = _agent_cache_opts(agent)
@@ -652,6 +687,11 @@ def _run_references_parallel(
             if slot.get("provider") == "moa":
                 results[idx] = _placeholder_output(slot, "[skipped: MoA presets cannot recursively reference MoA]")
                 continue
+            if _abandoned_still_running(_slot_label(slot)):
+                results[idx] = _placeholder_output(
+                    slot, "[failed: previous call to this advisor is still running past reference_timeout]")
+                logger.warning("MoA: not re-dispatching %s; its abandoned call is still running", _slot_label(slot))
+                continue
             futures[
                 executor.submit(
                     propagate_context_to_thread(_run_reference),
@@ -664,6 +704,7 @@ def _run_references_parallel(
                     cache_disabled=cache_disabled,
                     cache_ttl=cache_ttl,
                     agent=agent,
+                    abandon_fence=abandon_fence,
                 )
             ] = idx
 
@@ -700,6 +741,8 @@ def _run_references_parallel(
                 break
     finally:
         abandoned = interrupted or timed_out
+        if abandoned:
+            abandon_fence.set()
         executor.shutdown(wait=not abandoned, cancel_futures=abandoned)
 
     return [r for r in results if r is not None]

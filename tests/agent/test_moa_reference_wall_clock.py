@@ -19,6 +19,15 @@ import pytest
 import agent.moa_loop as moa
 
 
+@pytest.fixture(autouse=True)
+def _clean_abandoned_registry():
+    with moa._abandoned_lock:
+        moa._abandoned_inflight.clear()
+    yield
+    with moa._abandoned_lock:
+        moa._abandoned_inflight.clear()
+
+
 def _slot(model):
     return {"provider": "custom", "model": model}
 
@@ -66,3 +75,37 @@ def test_without_reference_timeout_the_fanout_waits_for_the_slow_leg(stalled_leg
     worker.start()
     worker.join(3.0)
     assert worker.is_alive(), "fan-out returned without a deadline; the stall is not reproduced"
+
+
+def test_timed_out_advisor_cannot_restamp_the_activity_clock(monkeypatch):
+    """Codex P1: an advisor still streaming after the deadline must not keep re-arming the
+    turn-liveness watchdog through its progress hook once the fan-out has abandoned it."""
+    touches = []
+    agent = type("A", (), {"_touch_activity": lambda self, d: touches.append(d)})()
+    fence = threading.Event()
+    hook = moa._reference_liveness_hook(agent, "custom:grok", fence)
+    hook()
+    assert len(touches) == 1
+    fence.set()
+    hook(); hook()
+    assert len(touches) == 1, "abandoned advisor chunks still stamped the activity clock"
+
+
+def test_still_running_abandoned_advisor_is_not_redispatched(stalled_leg, monkeypatch):
+    """Codex P1: a call that cannot be killed must not be stacked again by the next fan-out."""
+    calls = []
+    real = moa._run_reference
+
+    def counting(slot, ref_messages, **kwargs):
+        calls.append(slot["model"])
+        return real(slot, ref_messages, **kwargs)
+
+    monkeypatch.setattr(moa, "_run_reference", counting)
+    slots = [_slot("claude-think"), _slot("grok")]
+    msgs = [{"role": "user", "content": "q"}]
+    moa._run_references_parallel(slots, msgs, reference_timeout=0.5)
+    second = moa._run_references_parallel(slots, msgs, reference_timeout=0.5)
+    assert calls.count("grok") == 1, calls
+    texts = {label: text for label, text, _ in second}
+    assert texts["custom:grok"].startswith("[failed: previous call to this advisor is still running")
+    assert texts["custom:claude-think"] == "answer from claude-think"
