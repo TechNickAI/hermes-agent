@@ -109,3 +109,16 @@ def test_still_running_abandoned_advisor_is_not_redispatched(stalled_leg, monkey
     texts = {label: text for label, text, _ in second}
     assert texts["custom:grok"].startswith("[failed: previous call to this advisor is still running")
     assert texts["custom:claude-think"] == "answer from claude-think"
+
+
+def test_abandoned_advisor_suppression_is_scoped_to_its_profile(stalled_leg, monkeypatch):
+    """Codex P1: in a multiplex gateway, profile A's stuck advisor must not suppress the same
+    advisor label in profile B, which has its own route and credentials."""
+    home = {"key": "profile-a"}
+    monkeypatch.setattr("hermes_constants.hermes_home_key", lambda *a, **k: home["key"])
+    slots = [_slot("claude-think"), _slot("grok")]
+    msgs = [{"role": "user", "content": "q"}]
+    moa._run_references_parallel(slots, msgs, reference_timeout=0.5)       # A abandons grok
+    assert moa._abandoned_still_running("custom:grok")
+    home["key"] = "profile-b"
+    assert not moa._abandoned_still_running("custom:grok"), "profile A's stuck call suppressed profile B"

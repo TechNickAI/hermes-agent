@@ -156,26 +156,34 @@ _MAX_REFERENCE_WORKERS = 8
 # A running call cannot be killed, and every fan-out builds a fresh executor, so without this a
 # stuck advisor would be re-dispatched every turn and pile up billing threads. While one is still
 # running, that advisor is not dispatched again; it frees when the abandoned call finishes.
+# Keyed by (hermes_home_key(), label): a multiplex gateway serves several profiles whose routes
+# and credentials differ, so one profile's stuck call must not suppress another's advisor.
 _abandoned_lock = threading.Lock()
-_abandoned_inflight: dict[str, int] = {}
+_abandoned_inflight: dict[tuple[str, str], int] = {}
+
+
+def _abandoned_key(label: str) -> tuple[str, str]:
+    from hermes_constants import hermes_home_key
+    return (hermes_home_key(), label)
 
 
 def _abandoned_still_running(label: str) -> bool:
     with _abandoned_lock:
-        return _abandoned_inflight.get(label, 0) > 0
+        return _abandoned_inflight.get(_abandoned_key(label), 0) > 0
 
 
 def _track_abandoned(label: str, future: Any) -> None:
+    key = _abandoned_key(label)   # captured now: the done-callback runs on the worker thread
     with _abandoned_lock:
-        _abandoned_inflight[label] = _abandoned_inflight.get(label, 0) + 1
+        _abandoned_inflight[key] = _abandoned_inflight.get(key, 0) + 1
 
     def _release(_future: Any) -> None:
         with _abandoned_lock:
-            left = _abandoned_inflight.get(label, 1) - 1
+            left = _abandoned_inflight.get(key, 1) - 1
             if left > 0:
-                _abandoned_inflight[label] = left
+                _abandoned_inflight[key] = left
             else:
-                _abandoned_inflight.pop(label, None)
+                _abandoned_inflight.pop(key, None)
 
     future.add_done_callback(_release)
 
