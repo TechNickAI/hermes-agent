@@ -135,7 +135,8 @@ def test_classic_cli_console_non_ascii_reaches_wire(tmp_path: Path) -> None:
         try:
             wait_until(lambda: console.quiet_for(3.0), 120, "the classic CLI to finish painting its prompt")
             console.proc.write(f"{BMP} {tag}")
-            wait_until(lambda: tag in console.screen, 30, "the composer to echo the typed text")
+            # 120s: the echo took >30s on a loaded standard runner (larger runners stay well under).
+            wait_until(lambda: tag in console.screen, 120, "the composer to echo the typed text")
             echoed = _plain(console.screen)
             # An Enter within 50 ms of the last composer change is read as a pasted newline, and the
             # echo can paint inside that window: submit only once the typed echo has gone quiet.

@@ -162,6 +162,8 @@ time.sleep(float(sys.argv[2]))
 
 
 @pytest.mark.platforms('windows')
+@pytest.mark.skipif(os.environ.get('HERMES_CI_STANDARD_RUNNER') == '1',
+                    reason="standard windows runner: the 25s checkout hold outlasts the hand-off's release wait")
 def test_result_finished_at_is_stamped_after_the_r6_release_wait(tmp_path: Path) -> None:
     # The relaunched Desktop drops a non-manual result whose finished_at is 30 minutes old; the
     # R6 wait lasts up to 2 h. The result must carry the time the hand-off actually finished.

@@ -44,9 +44,9 @@ concurrency:
 jobs:
   install-update:
     name: Windows install.ps1 + hermes update E2E
-    runs-on: windows-latest-32-core
+    runs-on: windows-latest
     # A typical run is ~17 min; one slow runner took 28 min for the same work (run 36295230146).
-    timeout-minutes: 75
+    timeout-minutes: 150  # 2 workers on a standard runner
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -54,6 +54,17 @@ jobs:
           # serve.git is a bare clone of this checkout: the installer's treeless clone and
           # `hermes update` need real history and release tags (version identity), as on GitHub.
           fetch-depth: 0
+
+      - name: "Free C: on the standard runner"
+        # Every journey installs a full Hermes into a C:\Users profile; ~37 installs fill the
+        # standard runner's C: and the last two files fail with ENOSPC. Drop unused toolchains.
+        shell: pwsh
+        run: |
+          Get-PSDrive C | Format-Table Name,Used,Free
+          foreach ($p in 'C:\Android','C:\Program Files (x86)\Android','C:\ghcup','C:\Strawberry','C:\Miniconda','C:\rtools45','C:\Program Files\dotnet\sdk','C:\hostedtoolcache\windows\go','C:\hostedtoolcache\windows\Ruby','C:\hostedtoolcache\windows\PyPy') {
+            if (Test-Path -LiteralPath $p) { cmd /c "rmdir /s /q `"$p`"" 2>$null }
+          }
+          Get-PSDrive C | Format-Table Name,Used,Free
 
       - name: Set up locked Python and test dependencies
         uses: ./.github/actions/setup-pm
@@ -79,7 +90,9 @@ jobs:
           HERMES_E2E_PROFILES_ROOT: C:\Users
           HERMES_E2E_ARTIFACTS: ${{ runner.temp }}\win-update-e2e
           # One journey per file, all in parallel (each is mostly network + subprocess wait).
-          HERMES_TEST_WORKERS: '6'
+          # 6 parallel full installs hit ENOSPC on the standard runner's disk.
+          HERMES_TEST_WORKERS: '2'
+          HERMES_CI_STANDARD_RUNNER: '1'
           # test_crash_cells.py runs its whole journey (install, gateway phase, six crash cells)
           # inside one file: ~2,100 s on a normal runner, past 2,400 s on a slow one.
           HERMES_TEST_FILE_TIMEOUT: '3600'
