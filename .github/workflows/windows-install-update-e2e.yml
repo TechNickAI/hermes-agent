@@ -55,6 +55,17 @@ jobs:
           # `hermes update` need real history and release tags (version identity), as on GitHub.
           fetch-depth: 0
 
+      - name: "Free C: on the standard runner"
+        # Every journey installs a full Hermes into a C:\Users profile; ~37 installs fill the
+        # standard runner's C: and the last two files fail with ENOSPC. Drop unused toolchains.
+        shell: pwsh
+        run: |
+          Get-PSDrive C | Format-Table Name,Used,Free
+          foreach ($p in 'C:\Android','C:\Program Files (x86)\Android','C:\ghcup','C:\Strawberry','C:\Miniconda','C:\rtools45','C:\Program Files\dotnet\sdk','C:\hostedtoolcache\windows\go','C:\hostedtoolcache\windows\Ruby','C:\hostedtoolcache\windows\PyPy') {
+            if (Test-Path -LiteralPath $p) { cmd /c "rmdir /s /q `"$p`"" 2>$null }
+          }
+          Get-PSDrive C | Format-Table Name,Used,Free
+
       - name: Set up locked Python and test dependencies
         uses: ./.github/actions/setup-pm
         with:

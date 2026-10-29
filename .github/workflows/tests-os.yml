@@ -190,6 +190,8 @@ jobs:
           # starves cold child startup before the fixture's idle deadline.
           HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '4' || '' }}
           HERMES_CI_STANDARD_RUNNER: '1'  # fork runs on standard hosted runners, not *-32-core
+          # 600s: commit_outcome spawns real windows.ps1 trees and ran past 300s on windows-11-arm.
+          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.marker == 'windows' && '600' || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
