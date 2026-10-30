@@ -73,15 +73,30 @@ class GatewayTurnPersistenceMixin:
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
-        _intentional_silence = self._is_intentional_silence(agent_result, response)
+        _allow_human_silence = agent_result.get("queued_terminal_allow_human_silence")
+        if _allow_human_silence is None:
+            _allow_human_silence = self._allows_human_silence_markers(source)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
-        # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
-        # silent; any other human one must not.
-        from gateway.response_filters import is_machinery_display_kind, silence_allowed
+        # opened the chain: its origin, addressing and profile determine the final policy.
+        from gateway.response_filters import (
+            is_intentional_silence_agent_result, is_intentional_silence_response,
+            is_machinery_display_kind, silence_allowed,
+        )
         from gateway.run_turn import _unexpected_silence_reply
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
-        if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
+        _human_silence_opt_in = _allow_human_silence and not is_machinery_display_kind(_silence_kind)
+        _intentional_silence = is_intentional_silence_agent_result(
+            agent_result, response,
+            human_silence_opt_in=_human_silence_opt_in,
+        )
+        if _human_silence_opt_in and not _intentional_silence and is_intentional_silence_response(response):
+            # A rejected control token is not useful partial text; let empty-result recovery
+            # surface the failure or honor a deliberate interruption.
+            response = ""
+        if _intentional_silence and not silence_allowed(
+            _silence_kind, _silence_reply_expected, allow_human_silence_markers=_allow_human_silence,
+        ):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
@@ -90,7 +105,7 @@ class GatewayTurnPersistenceMixin:
             response = _unexpected_silence_reply()
         elif _intentional_silence and not is_machinery_display_kind(_silence_kind):
             logger.debug(
-                "silence marker suppressed on an unaddressed turn: platform=%s chat=%s",
+                "silence marker suppressed on an unaddressed or opted-in turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
             )
 
@@ -563,7 +578,7 @@ class GatewayTurnPersistenceMixin:
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
-            response = ""
+            return ""
 
         adapter = self._delivery_adapter_for(source)
         # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.

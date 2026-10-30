@@ -26,8 +26,9 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
-    display_kind_for_event, display_metadata_for_event, is_machinery_display_kind, reply_expected_metadata,
-    silence_allowed,
+    display_kind_for_event, display_metadata_for_event, is_intentional_silence_agent_result,
+    is_intentional_silence_response, is_invisible_only_response, is_machinery_display_kind,
+    reply_expected_metadata, silence_allowed,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -1779,8 +1780,29 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
-        if self._is_intentional_silence(_delivery_result, first_response):
-            if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
+        _allow_human_silence = self._allows_human_silence_markers(turn_ctx.source)
+        # Keep internal-notification policy independent of the human opt-in.
+        _human_silence_opt_in = (
+            _allow_human_silence and not is_machinery_display_kind(turn_ctx.persist_user_display_kind)
+        )
+        _intentional_silence = is_intentional_silence_agent_result(
+            _delivery_result, first_response,
+            human_silence_opt_in=_human_silence_opt_in,
+        )
+        if not _intentional_silence and (
+            is_invisible_only_response(first_response)
+            or (_human_silence_opt_in and is_intentional_silence_response(first_response))
+        ):
+            from gateway.run import _normalize_empty_agent_response, _sanitize_gateway_final_response
+
+            first_response = _normalize_empty_agent_response(_delivery_result, "")
+            first_response = _sanitize_gateway_final_response(turn_ctx.source.platform, first_response)
+            _already_streamed = False
+        if _intentional_silence:
+            if silence_allowed(
+                turn_ctx.persist_user_display_kind, turn_ctx.reply_expected,
+                allow_human_silence_markers=_allow_human_silence,
+            ):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
@@ -1998,6 +2020,9 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 "queued_terminal_inbound_id": next_inbound_id,
                 "queued_terminal_display_kind": next_display_kind,
                 "queued_terminal_reply_expected": next_reply_expected,
+                # Its profile also owns the silence opt-in, even when the outer handler runs under
+                # another profile.
+                "queued_terminal_allow_human_silence": self._allows_human_silence_markers(next_source),
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
                     if pending_event is not None and pending_event.internal else "result"),
@@ -2080,7 +2105,9 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         if not isinstance(response, dict) or response.get("failed") or finite_turn_required() is True:
             return
         _final = response.get("final_response") or ""
-        _is_empty_sentinel = not _final or _final == "(empty)"
+        # Empty/format-only finals belong to response shaping; never reconcile them by
+        # overwriting a cumulative stream's already-visible preamble with blank content.
+        _is_empty_sentinel = not _final or _final == "(empty)" or is_invisible_only_response(_final)
         # response_previewed: only suppress if that EXACT text was delivered, not unrelated commentary.
         # Unrelated commentary/progress must not be mistaken for the final response (#14238).
         _previewed = bool(response.get("response_previewed"))
