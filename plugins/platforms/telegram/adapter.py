@@ -5528,7 +5528,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
 
     @staticmethod
     async def _download_media_with_retry(source: Any, *, what: str = "media",
-                                         attempts: int = 3, base_delay: float = 1.0) -> "tuple[bytes, Any]":
+                                         attempts: int = 3, base_delay: float = 1.0,
+                                         reset: Optional[Callable[[], Awaitable[Any]]] = None) -> "tuple[bytes, Any]":
         """Fetch a Telegram file's bytes, retrying transient network timeouts.
 
         Returns ``(data, file_obj)`` -- callers need ``file_obj.file_path`` to infer the
@@ -5544,6 +5545,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         Permanent failures (bad file_id, forbidden, file-too-big) raise immediately so
         the caller still surfaces them -- this narrows the user-visible failure to real
         errors, it does not hide them.
+
+        ``reset`` rebuilds the HTTP pool between attempts: a timed-out download can leave a
+        wedged keep-alive connection that every retry reuses (2026-10-14: three 60s
+        timeouts in a row while the network itself was healthy, voice message lost).
         """
         last_exc: Optional[BaseException] = None
         for attempt in range(1, max(1, attempts) + 1):
@@ -5559,6 +5564,11 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 delay = base_delay * (2 ** (attempt - 1))
                 logger.info("[Telegram] Transient %s download failure (%s), retrying in %.1fs (attempt %d/%d)",
                             what, exc.__class__.__name__, delay, attempt, attempts)
+                if reset is not None:
+                    try:
+                        await reset()
+                    except Exception as reset_exc:  # noqa: BLE001 - a failed reset must not abort the retry
+                        logger.debug("[Telegram] HTTP pool reset before %s retry failed: %s", what, reset_exc)
                 await asyncio.sleep(delay)
         assert last_exc is not None
         logger.warning("[Telegram] %s download failed after %d attempts: %s",
@@ -5808,7 +5818,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if not (0 < self._int_or_zero(file_size) <= getattr(self, "_max_doc_bytes", 20 * 1024 * 1024)):
             return "oversized", file_size
         try:
-            data, file_obj = await self._download_media_with_retry(source, what="file")
+            data, file_obj = await self._download_media_with_retry(source, what="file", reset=self._drain_general_connections_after_pool_timeout)
             if not filename:
                 filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
             cached = await cache_media_bytes_async(data, filename=filename, mime_type=mime, default_kind=kind)
@@ -6249,7 +6259,13 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 self._note_instead_of_media(event, note or "")
                 logger.info("[Telegram] Skipped oversized user %s (size=%s)", kind, getattr(source, "file_size", None))
                 return
-            data, file_obj = await self._download_media_with_retry(source, what=kind)
+            data, file_obj = await self._download_av_fast_fallback(msg, source, kind, ext)
+            if data is None:  # recovered via the owner's account; already cached
+                cached_path = await (cache_video_from_bytes_async if kind == "video" else cache_audio_from_bytes_async)(file_obj, ext=ext)
+                event.media_urls = [cached_path]
+                event.media_types = [mime if kind != "video" else SUPPORTED_VIDEO_TYPES.get(ext, "video/mp4")]
+                logger.warning("[Telegram] Bot download of %s stalled; recovered via user-account fetch -> %s", kind, cached_path)
+                return
             if kind == "video":
                 ext = self._ext_from_path(getattr(file_obj, "file_path", None), SUPPORTED_VIDEO_TYPES, ext)
                 cached_path = await cache_video_from_bytes_async(bytes(data), ext=ext)
@@ -6260,6 +6276,17 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             event.media_types = [mime]
             logger.info("[Telegram] Cached user %s at %s", kind, cached_path)
         except Exception as e:
+            recovered = (await self._fetch_media_via_user_account(msg, kind, ext)
+                         if _is_transient_media_error(e) and not getattr(e, "_hermes_user_fetch_tried", False) else None)
+            if recovered:
+                if kind == "video":
+                    cached_path = await cache_video_from_bytes_async(recovered, ext=ext)
+                else:
+                    cached_path = await cache_audio_from_bytes_async(recovered, ext=ext)
+                event.media_urls = [cached_path]
+                event.media_types = [mime]
+                logger.warning("[Telegram] Bot download of %s timed out; recovered via user-account fetch -> %s", kind, cached_path)
+                return
             logger.warning("[Telegram] Failed to cache %s: %s", kind, _redact_telegram_error_text(e), exc_info=True)
             await self._surface_media_cache_failure(msg, event, label, e)
 
@@ -6268,6 +6295,75 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         """Append an item note (kept per item by an album merge); False lets the caller dispatch the event."""
         add_item_note(event, text)
         return False
+
+    _USER_MEDIA_FETCH_TIMEOUT = 90.0
+    _BOT_AV_FIRST_TRY_TIMEOUT = 15.0
+
+    async def _download_av_fast_fallback(self, msg: Any, source: Any, kind: str, ext: str):
+        """One short bot attempt, then the owner's-account fetch, then the full bot retry ladder.
+
+        2026-10-14: Telegram's getFile for this bot stalled (504 after 120s) all afternoon while every
+        other bot call and the owner's account were instant, so 3x60s bot retries just made her wait
+        ~3 min per memo. Returns (bytes, file_obj) from the bot, or (None, bytes) when the
+        owner's-account fetch recovered it."""
+        try:
+            return await asyncio.wait_for(
+                self._download_media_with_retry(source, what=kind, attempts=1),
+                timeout=self._BOT_AV_FIRST_TRY_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if not (isinstance(exc, asyncio.TimeoutError) or _is_transient_media_error(exc)):
+                raise
+            logger.info("[Telegram] Bot %s download slow/failed (%s); trying user-account fetch first",
+                        kind, exc.__class__.__name__)
+        recovered = await self._fetch_media_via_user_account(msg, kind, ext)
+        if recovered:
+            return None, recovered
+        try:
+            return await self._download_media_with_retry(
+                source, what=kind, reset=self._drain_general_connections_after_pool_timeout)
+        except Exception as exc:  # noqa: BLE001 - re-raised; tag so the caller skips a second user fetch
+            exc._hermes_user_fetch_tried = True  # type: ignore[attr-defined]
+            raise
+
+    async def _fetch_media_via_user_account(self, msg: Any, kind: str, ext: str) -> Optional[bytes]:
+        """Last-resort fetch through the owner's own Telegram account (local Telethon session).
+
+        2026-10-14: the bot's getFile call stalled 60s x3 on a healthy network while the
+        owner's account fetched the same voice memo in <1s. Local patch; skipped silently
+        when the helper script or its interpreter is absent."""
+        from hermes_constants import get_hermes_home
+        script = get_hermes_home() / "scripts" / "tg_user_media_fetch.py"
+        python = _Path.home() / ".tgcli" / "venv" / "bin" / "python"
+        chat_id = getattr(getattr(msg, "chat", None), "id", None) or getattr(msg, "chat_id", None)
+        msg_id = getattr(msg, "message_id", None)
+        if not (script.exists() and python.exists() and chat_id and msg_id):
+            return None
+        out = get_hermes_home() / "cache" / "audio" / f"userfetch_{abs(int(chat_id))}_{msg_id}{ext}"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(python), str(script), str(chat_id), str(msg_id), str(out),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=self._USER_MEDIA_FETCH_TIMEOUT)
+            except asyncio.TimeoutError:
+                proc.kill()
+                logger.warning("[Telegram] User-account %s fetch timed out", kind)
+                return None
+            if proc.returncode != 0 or not out.exists():
+                logger.warning("[Telegram] User-account %s fetch failed (rc=%s)", kind, proc.returncode)
+                return None
+            data = out.read_bytes()
+            out.unlink(missing_ok=True)
+            return data or None
+        except Exception as exc:  # noqa: BLE001 - fallback must never mask the original failure
+            logger.warning("[Telegram] User-account %s fetch errored: %s", kind, exc)
+            return None
+
+    async def _dispatch_with_text(self, event: MessageEvent, text: str) -> bool:
+        """Replace the event text with a user-facing note and dispatch it; returns True (handled)."""
+        event.text = text
+        await self.handle_message(event)
+        return True
 
     @staticmethod
     def _set_cached_media(event: MessageEvent, path: str, mime: str, mtype: MessageType, log_fmt: str) -> None:
@@ -6296,7 +6392,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     event, f"Document '{display}' is too large or its size could not be verified. Maximum: {self._max_doc_bytes // (1024 * 1024)} MB.")
             # Screenshots/photos sent as documents take the image cache + batching path.
             if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
-                image_bytes, file_obj = await self._download_media_with_retry(doc, what="image document")
+                image_bytes, file_obj = await self._download_media_with_retry(doc, what="image document", reset=self._drain_general_connections_after_pool_timeout)
                 image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
                 try:
                     cached_path = await cache_image_from_bytes_async(bytes(image_bytes), ext=image_ext)
@@ -6319,14 +6415,14 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     image_mime_to_ext.setdefault(_mime, _ext)
                 ext = image_mime_to_ext.get(doc.mime_type, "")
             if ext in SUPPORTED_VIDEO_TYPES:
-                video_bytes, file_obj = await self._download_media_with_retry(doc, what="video document")
+                video_bytes, file_obj = await self._download_media_with_retry(doc, what="video document", reset=self._drain_general_connections_after_pool_timeout)
                 self._set_cached_media(
                     event, await cache_video_from_bytes_async(bytes(video_bytes), ext=ext), SUPPORTED_VIDEO_TYPES[ext], MessageType.VIDEO,
                     "[Telegram] Cached user video document at %s")
                 return False  # the caller's tail dispatches (album queue for an album item)
             # Any file type is accepted (authorization is the gate, not the extension); unknown types get
             # application/octet-stream. Image documents already returned above.
-            raw_bytes, file_obj = await self._download_media_with_retry(doc, what="document")
+            raw_bytes, file_obj = await self._download_media_with_retry(doc, what="document", reset=self._drain_general_connections_after_pool_timeout)
             from gateway.platforms.base import cache_media_bytes_async
             cached = await cache_media_bytes_async(raw_bytes, filename=original_filename or f"document{ext or '.bin'}", mime_type=doc_mime)
             if cached is None:
@@ -6386,7 +6482,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if msg.photo:
             try:
                 # PhotoSize list sorted by size; largest last
-                image_bytes, file_obj = await self._download_media_with_retry(msg.photo[-1], what="photo")
+                image_bytes, file_obj = await self._download_media_with_retry(msg.photo[-1], what="photo", reset=self._drain_general_connections_after_pool_timeout)
                 ext = self._ext_from_path(file_obj.file_path, [".png", ".webp", ".gif", ".jpeg", ".jpg"], ".jpg")
                 self._set_cached_media(
                     event, await cache_image_from_bytes_async(bytes(image_bytes), ext=ext), f"image/{ext.lstrip('.')}", event.message_type,
@@ -6436,7 +6532,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             return
         fallback = f"a sticker with emoji {emoji}" if emoji else "a sticker"
         try:
-            image_bytes, file_obj = await self._download_media_with_retry(sticker, what="sticker")
+            image_bytes, file_obj = await self._download_media_with_retry(sticker, what="sticker", reset=self._drain_general_connections_after_pool_timeout)
             cached_path = await cache_image_from_bytes_async(bytes(image_bytes), ext=".webp")
             logger.info("[Telegram] Analyzing sticker at %s", cached_path)
             from tools.vision_tools import vision_analyze_tool

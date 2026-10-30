@@ -48,7 +48,7 @@ CHROMIUM_SANDBOX_BYPASS_ARGS: tuple[str, ...] = ("--no-sandbox", "--disable-dev-
 #   --disable-features=Translate                  no translate bubble covering the page
 _BASE_FLAGS: tuple[str, ...] = (
     "--no-first-run", "--no-default-browser-check", "--disable-background-networking",
-    "--disable-component-update", "--disable-default-apps", "--disable-sync", "--disable-features=Translate",
+    "--disable-component-update", "--disable-default-apps", "--disable-sync", "--disable-features=Translate,MacAppCodeSignClone",
 )
 # Only for the launcher-resolved packaged Chromium: a keyring unlock prompt (Linux desktops) or the macOS
 # keychain dialog would block an unattended launch. Never for a real or shared profile, whose cookies are

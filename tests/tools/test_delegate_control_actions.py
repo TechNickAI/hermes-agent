@@ -730,6 +730,21 @@ def test_completion_notification_trims_subagent_output_wall():
         _unregister_subagent("sa-2-attr0004")
 
 
+def test_single_completion_carries_silent_if_unchanged_instruction():
+    """Single completions must carry the same 'absorb silently' rule batches do.
+
+    Regression: 2026-10-09..13 'finished, nothing changes' posts after the user
+    asked to stop them; only the coalesced-batch formatter carried the rule.
+    """
+    from tools.process_registry_notifications import (
+        SILENT_IF_UNCHANGED, format_process_notification)
+
+    text = format_process_notification(
+        {"type": "completion", "session_id": "proc_s", "command": "du -sk ~",
+         "exit_code": 0, "output": "12345 /Users/x"})
+    assert SILENT_IF_UNCHANGED in text
+    assert "[SILENT]" in text
+    assert text.count("[IMPORTANT: Background process") == 1
 
 
 # ---------------------------------------------------------------------------
