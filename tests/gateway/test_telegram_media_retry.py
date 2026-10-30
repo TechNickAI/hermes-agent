@@ -162,3 +162,101 @@ def test_all_download_sites_use_the_retry_helper():
     ]
     # Exactly one raw download call may exist: the one inside the helper.
     assert len(raw) == 1, f"unretried media download site(s) reintroduced: {raw}"
+
+
+def test_retry_resets_http_pool_between_attempts():
+    """A wedged keep-alive connection must not be reused by every retry (2026-10-14:
+    three 60s timeouts in a row on a healthy network lost a voice message)."""
+    src = _FlakySource(_real_readtimeout_chain(), fail_times=2)
+    resets = []
+
+    async def _reset():
+        resets.append(src.calls)
+
+    data, _ = _run(
+        adapter_mod.TelegramAdapter._download_media_with_retry(
+            src, what="voice message", attempts=3, base_delay=0.0, reset=_reset
+        )
+    )
+    assert data == b"OGGDATA"
+    assert resets == [1, 2]  # reset after each failed attempt, before the next
+
+
+def _av_harness(fetch_result):
+    """Run the real _cache_inbound_av with a bot download that always times out."""
+    from types import SimpleNamespace
+
+    adapter = object.__new__(adapter_mod.TelegramAdapter)
+    surfaced = []
+    fetched = []
+
+    async def _fetch(msg, kind, ext):
+        fetched.append((kind, ext))
+        return fetch_result
+
+    async def _surface(msg, event, label, exc):
+        surfaced.append(label)
+
+    async def _no_reset():
+        return None
+
+    adapter._telegram_media_size_allowed = lambda source, label: (True, None)
+    adapter._fetch_media_via_user_account = _fetch
+    adapter._surface_media_cache_failure = _surface
+    adapter._drain_general_connections_after_pool_timeout = _no_reset
+    adapter._download_media_with_retry = lambda source, **kw: adapter_mod.TelegramAdapter._download_media_with_retry(
+        source, what=kw.get("what", "media"), attempts=2, base_delay=0.0)
+    event = SimpleNamespace(media_urls=[], media_types=[], text="")
+    src = _FlakySource(_real_readtimeout_chain(), fail_times=99)
+    _run(adapter._cache_inbound_av(SimpleNamespace(), event, src, "voice message", "voice", ".ogg", "audio/ogg"))
+    return event, surfaced, fetched
+
+
+def test_bot_timeout_recovers_via_user_account_without_resend(tmp_path, monkeypatch):
+    """2026-10-14: bot getFile stalled 3x60s on a healthy network and the memo was lost;
+    the owner's own account fetched it in <1s. The fallback must deliver the audio and
+    must NOT ask the human to resend."""
+    event, surfaced, fetched = _av_harness(b"OGGFROMUSER")
+    assert fetched == [("voice", ".ogg")]
+    assert surfaced == []
+    assert len(event.media_urls) == 1 and Path(event.media_urls[0]).read_bytes() == b"OGGFROMUSER"
+
+
+def test_fallback_failure_still_asks_for_resend():
+    event, surfaced, fetched = _av_harness(None)
+    assert fetched and surfaced == ["voice message"]
+    assert event.media_urls == []
+
+
+def test_stalled_bot_download_switches_to_user_account_fast():
+    """2026-10-14 afternoon: getFile for this bot hung (504 after 120s) on every memo while the
+    owner's account was instant. A stalled bot download must hand off after one short try,
+    not after 3x60s of retries."""
+    import asyncio as _aio
+    import time as _time
+    from types import SimpleNamespace
+
+    adapter = object.__new__(adapter_mod.TelegramAdapter)
+    adapter._BOT_AV_FIRST_TRY_TIMEOUT = 0.2
+    fetched, surfaced = [], []
+
+    class _Hang:
+        async def get_file(self):
+            await _aio.sleep(30)
+
+    async def _fetch(msg, kind, ext):
+        fetched.append(kind)
+        return b"OGGFAST"
+
+    async def _surface(msg, event, label, exc):
+        surfaced.append(label)
+
+    adapter._telegram_media_size_allowed = lambda source, label: (True, None)
+    adapter._fetch_media_via_user_account = _fetch
+    adapter._surface_media_cache_failure = _surface
+    event = SimpleNamespace(media_urls=[], media_types=[], text="")
+    t0 = _time.monotonic()
+    _run(adapter._cache_inbound_av(SimpleNamespace(), event, _Hang(), "voice message", "voice", ".ogg", "audio/ogg"))
+    assert _time.monotonic() - t0 < 5
+    assert fetched == ["voice"] and surfaced == []
+    assert Path(event.media_urls[0]).read_bytes() == b"OGGFAST"

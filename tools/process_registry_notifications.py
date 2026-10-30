@@ -453,6 +453,12 @@ def _delegation_attribution_line(evt: dict) -> str | None:
             + (f' Task: "{goal}"' if goal else ""))
 
 
+SILENT_IF_UNCHANGED = (
+    "If this result does not change what you already told the user, reply with exactly "
+    "[SILENT] and nothing else; do not post a 'finished, nothing changes' note. Before "
+    "saying a result 'doesn't affect anything', verify that against the current state.")
+
+
 def _completion_status(evt: dict) -> str:
     reason = evt.get("completion_reason") or "exited"
     if reason == "killed":
@@ -501,6 +507,10 @@ def format_process_notification(evt: dict) -> str | None:
         # Say so where the output is the payload (a teammate's reply): a silent tail reads as whole.
         _out = (f"...(first {evt['output_cut']} characters cut — process(action=\"log\", "
                 f"session_id=\"{_sid}\") has the full output)\n{_out}")
+    # Single completions previously lacked the "absorb silently" instruction the
+    # batched formatter carries, so finished-but-unchanged checks produced
+    # "nothing new" posts the user had explicitly asked to stop (2026-10-09..13).
     return (
         f"[IMPORTANT: Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
-        f"{attribution}Command: {_cmd}\nOutput:\n{_out}]")
+        f"{attribution}Command: {_cmd}\nOutput:\n{_out}\n"
+        f"{SILENT_IF_UNCHANGED}]")
