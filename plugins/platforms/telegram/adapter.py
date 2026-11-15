@@ -3456,6 +3456,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send a message to a Telegram chat."""
+        from .recipient_link_gate import recipient_link_error
+        link_error = await recipient_link_error(content)
+        if link_error:
+            return SendResult(success=False, error=link_error, retryable=False)
         if not self._bot:
             live = self._replacement_telegram_adapter()
             if live is not None:
@@ -3636,6 +3640,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         Telegram caps a message at 4096 UTF-16 codeunits. Streaming replies that outgrow it must NOT be truncated
         silently nor fail (the consumer would re-send a duplicate): edit with the first chunk, send the rest as
         continuations, and return the final chunk's id as the next edit target."""
+        from .recipient_link_gate import recipient_link_error
+        link_error = await recipient_link_error(content)
+        if link_error:
+            return SendResult(success=False, error=link_error, retryable=False)
         if not self._bot:
             return await self._edit_via_replacement(chat_id, message_id, content, finalize=finalize, metadata=metadata)
         # Shared per-chat budget (#116312): an interim (preview) edit is SKIPPED when the slot is busy —
@@ -3869,6 +3877,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
     async def send_draft(self, chat_id: str, draft_id: int, content: str, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Stream a partial message via ``sendRichMessageDraft`` (when rich is enabled and supported) else
         ``sendMessageDraft``; reusing ``draft_id`` animates the preview. The caller sends the final text."""
+        from .recipient_link_gate import recipient_link_error
+        link_error = await recipient_link_error(content)
+        if link_error:
+            return SendResult(success=False, error=link_error, retryable=False)
         return await _flood_window.send_draft(self, chat_id, draft_id, content, metadata)
 
     async def _send_message_with_thread_fallback(self, **kwargs):

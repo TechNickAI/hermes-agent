@@ -749,6 +749,7 @@ class GatewayBusySessionMixin:
                 )
             if steered:
                 self._fold_into_running_turn(running_agent, session_key, event)
+                await self._ack_steered_event(event)
             else:
                 effective_mode = "queue"
         elif (
@@ -763,6 +764,18 @@ class GatewayBusySessionMixin:
             effective_mode=effective_mode, demoted_for_subagents=demoted_for_subagents,
             demoted_for_compression=demoted_for_compression, steered=steered, redirected=redirected,
         )
+
+    async def _ack_steered_event(self, event: MessageEvent) -> None:
+        """A steered message never opens its own turn, so the adapter's read-receipt reaction
+        (on_processing_start/complete) never fired for it. Mark it read the moment it lands in the
+        running turn. Julianna-host patch (custom-patches/telegram-steer-read-receipt.md); fail-open."""
+        try:
+            from gateway.platforms.event import ProcessingOutcome
+            from gateway.run_turn_followup_ack import _run_followup_processing_hook
+            adapter = self._delivery_adapter_for(event.source)
+            await _run_followup_processing_hook(adapter, event, "on_processing_complete", ProcessingOutcome.SUCCESS)
+        except Exception as exc:  # never let an acknowledgement break message flow
+            logger.debug("steer read-receipt failed: %s", exc)
 
     @staticmethod
     def _demote_interrupt(session_key: str, why: str) -> str:
