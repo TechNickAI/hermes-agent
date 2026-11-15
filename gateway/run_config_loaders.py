@@ -127,6 +127,7 @@ class GatewayConfigLoadersMixin:
         # ``self.config`` (including a ``gateway --config`` file) serves the primary profile; only a
         # turn routed to another profile reads that profile's config.yaml.
         routed = bool(runtime) and runtime != (getattr(self, "_primary_profile_name", None) or "default")
+        profile_default = bool(getattr(config, "allow_human_silence_markers", False)) if config is not None else False
         try:
             if config is None or routed:
                 raw = _load_gateway_config(self._resolve_profile_home_for_source(source) / "config.yaml")
@@ -141,6 +142,8 @@ class GatewayConfigLoadersMixin:
                     overrides = section["channel_overrides"]
                 config = GatewayConfig.from_dict({"platforms": {name: {
                     "channel_overrides": overrides if isinstance(overrides, dict) else {}}}})
+                gw = gateway_section if isinstance(gateway_section, dict) else {}
+                profile_default = bool(gw.get("allow_human_silence_markers", raw.get("allow_human_silence_markers", False)))
             override = _get_channel_override(
                 config, source.platform, source.chat_id,
                 thread_id=source.thread_id, parent_id=source.parent_chat_id)
@@ -149,7 +152,10 @@ class GatewayConfigLoadersMixin:
             logger.warning("Room allow_silence lookup failed for %s; keeping the reply rule",
                            source.chat_id, exc_info=True)
             return None
-        return override.allow_silence if override is not None else None
+        if override is not None and override.allow_silence is not None:
+            return override.allow_silence
+        # Fleet shim: the profile-wide opt-in is the room default when no room says otherwise.
+        return True if profile_default else None
 
     def _resolve_model_for_channel(
         self, platform: Platform, chat_id: str, *, user_config: Optional[dict] = None,
