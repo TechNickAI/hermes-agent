@@ -53,6 +53,11 @@ DEFAULT_GATE_MAX_RETRIES = 3
 # Longest a pid/session wait barrier may hold the loop before judging resumes. Timed barriers
 # (``waiting_until``) carry their own deadline and are exempt.
 _MAX_BARRIER_WAIT_S = 30 * 60
+# Longest a timed (``wait_for_seconds``) park may last. Timed waits exist for rate-limit backoff and
+# for live delegations; a judge that turns "my next step needs tomorrow's data" into a 31-hour park
+# (111,600 s, 2026-11-22) silently drops the goal overnight. Longer asks are clamped; after the
+# clamp the loop re-judges and the agent must take another step or say it is blocked.
+_MAX_TIMED_WAIT_S = 30 * 60
 # Bounded tail of a failed gate's combined stdout/stderr fed back to the agent.
 _GATE_OUTPUT_TAIL_CHARS = 3000
 
@@ -153,6 +158,10 @@ JUDGE_SYSTEM_PROMPT = (
     "nothing else dispatchable — return ``wait_for_seconds`` between 600 and "
     "1800. Their results wake the agent on their own; re-poking it now only "
     "produces a status recap.\n"
+    "Never pick WAIT because the agent says its next step needs data that "
+    "arrives later (tomorrow's games, a scheduled report) or because it "
+    "\"paused\" or \"ran out of ideas\": that is CONTINUE, since it can still "
+    "test other ideas inside the goal. Timed waits are capped at 1800 s.\n"
     "Picking WAIT parks the loop without burning a turn; it resumes "
     "automatically when the pid exits or the time elapses. Do NOT pick WAIT "
     "just because work remains — only when re-poking now would be pure "
@@ -1470,8 +1479,12 @@ class GoalManager:
                 logger.info("goal judge: wait_on_pid %s is not alive on this host; continuing", pid)
                 return None
         else:
-            self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
-            tgt = f"{wait_directive['seconds']}s"
+            asked = int(wait_directive["seconds"])
+            seconds = min(asked, _MAX_TIMED_WAIT_S)
+            if seconds < asked:
+                logger.info("goal %s: judge asked to park %ds; clamped to %ds", self.session_id, asked, seconds)
+            self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
+            tgt = f"{seconds}s"
         return _decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}")
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> dict[str, Any]:
